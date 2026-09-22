@@ -1,0 +1,153 @@
+{
+  "schema": "jev-bridge-alignment-v1",
+  "date": "2026-09-22",
+  "bridge": {
+    "upstream_model": "MiniCPM5-2B-Q8_0",
+    "upstream_runtime": "llama.cpp b11096 over HTTP",
+    "probe": "openai-completions-top-k",
+    "prompt_version": "direct-options-v1"
+  },
+  "reference": {
+    "source": "fastjev results/raw/browser-ladder-minicpm5-2b.predictions.jsonl",
+    "model": "openbmb/MiniCPM5-2B",
+    "revision": "12a3808a956f869c767195e9266b59c4d21d92e2",
+    "dtype": "bfloat16",
+    "runtime": "Torch 2.10.0+cu128 / transformers 5.17.0"
+  },
+  "workload": {
+    "fixture": "fastjev benchmarks/data/authored144.jsonl",
+    "rows": 144
+  },
+  "alignment": {
+    "prompt_sha256_equal": 144,
+    "input_tokens_equal": 144,
+    "argmax_agreement": 139,
+    "max_probability_delta_median": 0.0107,
+    "max_probability_delta_p90": 0.0641,
+    "max_probability_delta_max": 0.1804
+  },
+  "quality": {
+    "reference_mean_family_balanced_accuracy": 0.6863,
+    "bridge_mean_family_balanced_accuracy": 0.681,
+    "reference_global_balanced_accuracy": 0.6998,
+    "bridge_global_balanced_accuracy": 0.693,
+    "per_family": [
+      {
+        "family": "candidate_selection",
+        "n": 48,
+        "reference_balanced_accuracy": 0.5786,
+        "bridge_balanced_accuracy": 0.5786
+      },
+      {
+        "family": "evidence_interpretation",
+        "n": 48,
+        "reference_balanced_accuracy": 0.7675,
+        "bridge_balanced_accuracy": 0.7516
+      },
+      {
+        "family": "rule_application",
+        "n": 48,
+        "reference_balanced_accuracy": 0.7127,
+        "bridge_balanced_accuracy": 0.7127
+      }
+    ]
+  },
+  "disagreements": [
+    {
+      "id": "0ebd299739302d8b057b",
+      "family": "evidence_interpretation",
+      "gold_id": "supported",
+      "reference_predicted_id": "supported",
+      "bridge_predicted_id": "contradicted",
+      "reference_probabilities": [
+        0.416067,
+        0.049692,
+        0.534241
+      ],
+      "bridge_probabilities": [
+        0.491803,
+        0.057587,
+        0.45061
+      ],
+      "reference_top2_margin": 0.118174,
+      "bridge_top2_margin": 0.041192
+    },
+    {
+      "id": "21ca7a8b970e36b8e20f",
+      "family": "rule_application",
+      "gold_id": "prohibited",
+      "reference_predicted_id": "prohibited",
+      "bridge_predicted_id": "insufficient",
+      "reference_probabilities": [
+        0.499518,
+        0.499518,
+        0.000964
+      ],
+      "bridge_probabilities": [
+        0.374397,
+        0.624687,
+        0.000916
+      ],
+      "reference_top2_margin": 0.0,
+      "bridge_top2_margin": 0.250289
+    },
+    {
+      "id": "3b0958cabc339005cf66",
+      "family": "evidence_interpretation",
+      "gold_id": "insufficient",
+      "reference_predicted_id": "supported",
+      "bridge_predicted_id": "insufficient",
+      "reference_probabilities": [
+        0.433881,
+        0.557114,
+        0.009005
+      ],
+      "bridge_probabilities": [
+        0.501354,
+        0.487602,
+        0.011045
+      ],
+      "reference_top2_margin": 0.123233,
+      "bridge_top2_margin": 0.013752
+    },
+    {
+      "id": "6d64a8459f64eac7f4cc",
+      "family": "evidence_interpretation",
+      "gold_id": "insufficient",
+      "reference_predicted_id": "insufficient",
+      "bridge_predicted_id": "contradicted",
+      "reference_probabilities": [
+        0.615443,
+        0.373285,
+        0.011272
+      ],
+      "bridge_probabilities": [
+        0.435091,
+        0.552391,
+        0.012518
+      ],
+      "reference_top2_margin": 0.242158,
+      "bridge_top2_margin": 0.1173
+    },
+    {
+      "id": "b531dd603bf080dab820",
+      "family": "rule_application",
+      "gold_id": "prohibited",
+      "reference_predicted_id": "insufficient",
+      "bridge_predicted_id": "prohibited",
+      "reference_probabilities": [
+        0.374218,
+        0.008801,
+        0.616981
+      ],
+      "bridge_probabilities": [
+        0.50409,
+        0.009904,
+        0.486006
+      ],
+      "reference_top2_margin": 0.242763,
+      "bridge_top2_margin": 0.018084
+    }
+  ],
+  "boundary": "The reference is the committed BF16 Torch run. The bridge run is Q8_0 through llama.cpp. The quality delta is therefore a quantization delta on identical prompts, not a bridge implementation delta: prompt_sha256 and input_tokens match on every row."
+}

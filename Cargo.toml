@@ -1,0 +1,20 @@
+[package]
+name = "jev-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "Bridge a generic OpenAI-compatible inference API into a Jev-style decision scoring service"
+license = "MIT"
+repository = "https://github.com/lib-x/jev-bridge"
+readme = "README.md"
+keywords = ["llm", "llama-cpp", "logprobs", "classification", "inference"]
+categories = ["web-programming::http-server", "science"]
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
