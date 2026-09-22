@@ -50,7 +50,7 @@ or `null`; structured values are rendered as JSON.
 |---|---|---|
 | **llama.cpp** (`llama-server`) | fully supported | `/apply-template` + `/tokenize` for the contract, `/v1/completions` or `/completion` for scoring |
 | Generic OpenAI-compatible | supported when the runtime exposes logprobs | `/v1/completions` with `logprobs` |
-| vLLM | probe paths implemented, local template rendering not yet | `allowed_token_ids` + `logprob_token_ids`, or `allowed_token_ids` + top-k |
+| vLLM | supported; supply the template | `allowed_token_ids` + `logprob_token_ids`, or `allowed_token_ids` + top-k; render with `--chat-template-file` |
 
 The bridge picks one of these transports at startup by probing, and refuses to
 start rather than guessing. See [Transport probing](#transport-probing).
@@ -236,9 +236,90 @@ Public modules:
 | Module | Contents |
 |---|---|
 | `server` | `Bridge`, `BridgeConfig`, `DetailedScore`, `router`, `AppState` |
-| `strategy` | `Probe`, transport bodies, response parsing |
-| `prompt` | prompt contract, single-token check, softmax, `ServerTemplate` |
-| `wire` | System One request validation and response construction |
+| `strategy` | `Probe`, typed request bodies, `CompletionResponse`, parsing |
+| `prompt` | prompt contract, `ChatMessage`, `RuntimeClient`, `LocalComponents`, `ChatTemplate` |
+| `render` | `LocalRenderer` — minijinja rendering with CPython string methods |
+| `tokenizer` | `LocalTokenizer` — the `tokenizers` crate behind the same checks |
+| `wire` | `SystemOneResponse`, `Answer`, request validation, `OrderedMap` |
+
+Bodies, responses and answers are typed structs rather than loose JSON
+documents: the scoring request/response pairs, the System One response with its
+`choice`/`noul`/`score` enum, and the health payload are all `Serialize`/
+`Deserialize` types. `serde_json::Value` remains only where the payload really
+is dynamic — the caller's `state`, the values inside `criteria`, and the Python
+JSON layout that the prompt contract pins byte for byte.
+
+## Running without runtime endpoints
+
+Runtimes differ in which helper endpoints they expose. The bridge uses the
+runtime for both rendering and tokenization by default, and each half can be
+moved in-process independently:
+
+| Flag | Replaces | Needed for |
+|---|---|---|
+| `--chat-template-file` + `--chat-template-context` | `/apply-template` | vLLM and anything else without that endpoint |
+| `--tokenizer-json` | `/tokenize` and `/detokenize` | runtimes with no tokenize endpoint, or fully offline startup |
+
+```bash
+# Render locally, tokenize through the runtime
+./target/release/jev-bridge \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen3.5-4B \
+  --served-model bridge-qwen3.5-4b \
+  --served-model-release-date 2026-09-22 \
+  --chat-template-file qwen3.5.chat_template.jinja \
+  --chat-template-context '{"bos_token": "", "eos_token": "<|im_end|>"}'
+
+# Both halves local: no /apply-template and no /tokenize needed
+./target/release/jev-bridge \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen3.5-4B \
+  --served-model bridge-qwen3.5-4b \
+  --served-model-release-date 2026-09-22 \
+  --chat-template-file qwen3.5.chat_template.jinja \
+  --chat-template-context '{"bos_token": "", "eos_token": "<|im_end|>"}' \
+  --tokenizer-json /models/Qwen3.5-4B/tokenizer.json
+```
+
+Take the **model's own** template and tokenizer, never a hand-written or
+foreign pair: a different vocabulary silently scores the wrong token ids, and a
+different template silently changes the prompt. For a llama.cpp server both can
+be read from `/props`:
+
+```bash
+curl -s "http://127.0.0.1:8080/props?model=$MODEL" | jq -r .chat_template > template.jinja
+```
+
+The template context carries the variables transformers supplies besides the
+messages. A template that begins with `{{- bos_token }}` needs `bos_token`
+there, or the rendered prompt silently lacks its BOS token.
+
+`GET /health` reports `renders_locally` and `tokenizes_locally`, so you can
+confirm what the bridge actually negotiated.
+
+Templates written for transformers use Python string methods (`split`,
+`replace`, `startswith`, `strip`, …) that the Rust minijinja lacks. The bridge
+supplies them with CPython semantics, including treating the argument of
+`strip`/`lstrip`/`rstrip` as a character set rather than a prefix. Local
+rendering was checked byte for byte against llama.cpp's own `/apply-template`
+output on a real model template.
+
+## Examples
+
+Three runnable examples live in `examples/`. Each reads its configuration from
+the environment, so no credentials are baked in:
+
+| Example | Shows |
+|---|---|
+| `cargo run --example score_rows` | connecting a `Bridge`, scoring rows, reading `DetailedScore` |
+| `cargo run --example serve` | exposing the same bridge over HTTP with `router` |
+| `cargo run --example local_template` | rendering a template in-process and inspecting the prompt |
+
+```bash
+export JEV_BRIDGE_UPSTREAM_URL=http://127.0.0.1:8080/v1
+export JEV_BRIDGE_UPSTREAM_KEY=...        # only if the server requires it
+cargo run --example score_rows
+```
 
 ## Transport probing
 
@@ -286,6 +367,9 @@ numbers:
 | `--served-model-description` | Description returned by `GET /v1/models` |
 | `--served-model-release-date` | ISO date returned by `GET /v1/models` (required) |
 | `--chat-template-kwargs` | JSON passed when rendering the template; default `{"enable_thinking": false}` |
+| `--chat-template-file` | Render the template locally from this Jinja file instead of calling `/apply-template` |
+| `--chat-template-context` | JSON added to every local render, e.g. `{"bos_token": "<s>"}` |
+| `--tokenizer-json` | Tokenize locally with this `tokenizer.json` instead of calling `/tokenize` |
 | `--max-input-tokens` | Reject rows above this token count (no truncation) |
 | `--host` / `--port` | Bind address, default `127.0.0.1:8100` |
 | `--api-key` | Bearer token clients must present; prefer `JEV_BRIDGE_API_KEY` |
@@ -314,16 +398,14 @@ never written to disk.
 cargo test
 ```
 
-39 tests: 26 unit tests (wire contract, CPython JSON layout, the three response
-shapes, softmax stability, missing options must error) plus 13 integration tests
-split between `tests/bridge.rs` (library API, including `DetailedScore` fields)
-and `tests/contract.rs` (HTTP surface).
+52 tests: 37 unit tests (wire contract, CPython JSON layout, the three response
+shapes, softmax stability, missing options must error, CPython-semantics
+template methods) plus 15 integration tests split between `tests/bridge.rs`
+(library API, including `DetailedScore` fields) and `tests/contract.rs` (HTTP
+surface, local rendering, local tokenization).
 
 ## Known limitations
 
-- Only runtimes that render templates server-side are supported today
-  (llama.cpp `/apply-template` + `/tokenize`). Reaching vLLM needs a local
-  tokenizer plus minijinja rendering path, which is not implemented.
 - Decisions are serialized: several questions in one request are scored one
   after another, and upstream calls are not batched.
 - The upstream revision cannot be pinned by this process. Reproducibility
@@ -331,3 +413,7 @@ and `tests/contract.rs` (HTTP surface).
 - The alignment reference is BF16 while the bridge run is Q8_0, so the 0.0053
   delta is a quantization delta, not a bridge delta. An equal-precision
   comparison needs a BF16 upstream.
+- With a local tokenizer the bridge trusts the file it is given. A foreign
+  `tokenizer.json` produces plausible-looking scores from the wrong token ids,
+  so `verify_special_tokens` checks the context's special tokens against the
+  vocabulary at startup but cannot check that the vocabulary is the model's own.

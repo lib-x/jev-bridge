@@ -385,18 +385,110 @@ fn normalized_probabilities(spec: &QuestionSpec, result: &ScoredAnswer) -> Resul
     Ok(result.probabilities.iter().map(|value| value / total).collect())
 }
 
+/// An ordered map that serialises as a JSON object.
+///
+/// `serde_json::Map` only holds `Value`, and option order matters for
+/// readability because it follows the caller's own criteria order, so the pairs
+/// stay in a vector and are written out as an object.
+#[derive(Debug)]
+pub struct OrderedMap<V>(Vec<(String, V)>);
+
+impl<V> OrderedMap<V> {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn insert(&mut self, key: String, value: V) {
+        self.0.push((key, value));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<V> Default for OrderedMap<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V: Serialize> Serialize for OrderedMap<V> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in &self.0 {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+/// One answer in a System One response.
+///
+/// The `type` tag is what makes the three shapes distinguishable: a `choice`
+/// carries a winner and a distribution, a `noul` carries the probability of
+/// `true`, and a `score` carries a probability-weighted value plus the legend
+/// that maps its levels back to text.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Answer {
+    Noul {
+        noul: f64,
+    },
+    Choice {
+        choice: String,
+        probabilities: OrderedMap<f64>,
+        confidence: f64,
+    },
+    Score {
+        score: f64,
+        legend: OrderedMap<String>,
+        probabilities: OrderedMap<f64>,
+        confidence: f64,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    /// Always zero: the bridge reads log probabilities instead of generating.
+    pub output_tokens: u64,
+}
+
+/// The bridge's own extension block, mirroring fastjev's System One adapter.
+#[derive(Debug, Serialize)]
+pub struct FastjevMeta {
+    pub probability_status: &'static str,
+    pub confidence_method: &'static str,
+    pub prompt_versions: Vec<String>,
+}
+
+/// The documented System One response shape.
+#[derive(Debug, Serialize)]
+pub struct SystemOneResponse {
+    pub model: String,
+    pub answers: OrderedMap<Answer>,
+    pub usage: Usage,
+    pub fastjev: FastjevMeta,
+}
+
 /// Convert scorer results to the documented System One response shape.
 pub fn response_from_results(
     served_model: &str,
     specs: &[QuestionSpec],
     results: &[ScoredAnswer],
-) -> Result<Value> {
+) -> Result<SystemOneResponse> {
     if results.len() != specs.len() {
         return Err(WireError(
             "Scorer returned a different number of results than requested".to_string(),
         ));
     }
-    let mut answers = Map::new();
+    let mut answers = OrderedMap::new();
     let mut input_tokens: u64 = 0;
     let mut prompt_versions: Vec<String> = Vec::new();
     for (spec, result) in specs.iter().zip(results) {
@@ -411,9 +503,9 @@ pub fn response_from_results(
                     best
                 }
             });
-        let mut distribution = Map::new();
+        let mut distribution = OrderedMap::new();
         for (option_id, value) in spec.option_ids.iter().zip(&probabilities) {
-            distribution.insert(option_id.clone(), Value::from(*value));
+            distribution.insert(option_id.clone(), *value);
         }
         let answer = match spec.kind {
             Kind::Noul => {
@@ -421,37 +513,34 @@ pub fn response_from_results(
                     .option_ids
                     .iter()
                     .position(|option_id| option_id == "true")
-                    .ok_or_else(|| WireError(format!("Scorer result for {:?} lost its true option", spec.id)))?;
-                serde_json::json!({
-                    "type": "noul",
-                    "noul": probabilities[true_index],
-                })
+                    .ok_or_else(|| {
+                        WireError(format!("Scorer result for {:?} lost its true option", spec.id))
+                    })?;
+                Answer::Noul {
+                    noul: probabilities[true_index],
+                }
             }
-            Kind::Choice => serde_json::json!({
-                "type": "choice",
-                "choice": spec.option_ids[winner_index],
-                "probabilities": distribution,
-                "confidence": distribution_confidence(&probabilities),
-            }),
+            Kind::Choice => Answer::Choice {
+                choice: spec.option_ids[winner_index].clone(),
+                probabilities: distribution,
+                confidence: distribution_confidence(&probabilities),
+            },
             Kind::Score => {
                 let score: f64 = probabilities
                     .iter()
                     .enumerate()
                     .map(|(index, value)| index as f64 * value)
                     .sum();
-                let legend: Map<String, Value> = spec
-                    .legend
-                    .iter()
-                    .enumerate()
-                    .map(|(index, text)| (index.to_string(), Value::from(text.clone())))
-                    .collect();
-                serde_json::json!({
-                    "type": "score",
-                    "score": score,
-                    "legend": legend,
-                    "probabilities": distribution,
-                    "confidence": distribution_confidence(&probabilities),
-                })
+                let mut legend: OrderedMap<String> = OrderedMap::new();
+                for (index, text) in spec.legend.iter().enumerate() {
+                    legend.insert(index.to_string(), text.clone());
+                }
+                Answer::Score {
+                    score,
+                    legend,
+                    probabilities: distribution,
+                    confidence: distribution_confidence(&probabilities),
+                }
             }
         };
         answers.insert(spec.id.clone(), answer);
@@ -463,16 +552,19 @@ pub fn response_from_results(
         }
     }
     prompt_versions.sort();
-    Ok(serde_json::json!({
-        "model": served_model,
-        "answers": answers,
-        "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-        "fastjev": {
-            "probability_status": PROBABILITY_STATUS,
-            "confidence_method": CONFIDENCE_METHOD,
-            "prompt_versions": prompt_versions,
+    Ok(SystemOneResponse {
+        model: served_model.to_string(),
+        answers,
+        usage: Usage {
+            input_tokens,
+            output_tokens: 0,
         },
-    }))
+        fastjev: FastjevMeta {
+            probability_status: PROBABILITY_STATUS,
+            confidence_method: CONFIDENCE_METHOD,
+            prompt_versions,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -591,7 +683,10 @@ mod tests {
                 prompt_version: Some("direct-options-v1".into()),
             },
         ];
-        let response = response_from_results("bridge-model", &specs, &results).unwrap();
+        let response = serde_json::to_value(
+            response_from_results("bridge-model", &specs, &results).unwrap(),
+        )
+        .unwrap();
         assert_eq!(response["answers"]["is_urgent"]["noul"], 0.9);
         assert_eq!(response["answers"]["department"]["choice"], "technical");
         assert_eq!(response["answers"]["severity"]["score"], 1.0);

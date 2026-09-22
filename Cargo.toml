@@ -13,8 +13,24 @@ categories = ["web-programming::http-server", "science"]
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+minijinja = "2.24.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+tokenizers = { version = "0.23.2", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
+
+[features]
+default = ["local-tokenizer"]
+# Local tokenization through the Hugging Face tokenizers crate. Disable with
+# --no-default-features for a library-only build without that dependency; the
+# binary needs it because --tokenizer-json is part of its interface.
+local-tokenizer = ["dep:tokenizers"]
+
+[[bin]]
+name = "jev-bridge"
+path = "src/main.rs"
+required-features = ["local-tokenizer"]
+
+

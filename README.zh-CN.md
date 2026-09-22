@@ -43,7 +43,7 @@ Jev 的能力不是权重里的东西，而是一层读法协议。这个桥接�
 |---|---|---|
 | **llama.cpp**（`llama-server`） | 完整支持 | 契约走 `/apply-template` + `/tokenize`，打分走 `/v1/completions` 或 `/completion` |
 | 通用 OpenAI 兼容 | 在暴露 logprobs 时可支持 | `/v1/completions` + `logprobs` |
-| vLLM | 探测路径已实现，本地模板渲染未实现 | `allowed_token_ids` + `logprob_token_ids`，或 `allowed_token_ids` + top-k |
+| vLLM | 支持，需自行提供模板 | `allowed_token_ids` + `logprob_token_ids`，或 `allowed_token_ids` + top-k；用 `--chat-template-file` 本地渲染 |
 
 启动时通过探测在下面几种传输里选一个，选不出来就拒绝启动，不猜。见
 [传输探测](#传输探测)。
@@ -220,9 +220,79 @@ axum::serve(listener, router(state)).await?;
 | 模块 | 内容 |
 |---|---|
 | `server` | `Bridge`、`BridgeConfig`、`DetailedScore`、`router`、`AppState` |
-| `strategy` | `Probe`、各传输的请求体、响应解析 |
-| `prompt` | prompt 契约、单 token 校验、softmax、`ServerTemplate` |
-| `wire` | System One 请求校验与响应构造 |
+| `strategy` | `Probe`、类型化的请求体、`CompletionResponse`、解析 |
+| `prompt` | prompt 契约、`ChatMessage`、`RuntimeClient`、`LocalComponents`、`ChatTemplate` |
+| `render` | `LocalRenderer` —— minijinja 渲染 + CPython 字符串方法 |
+| `tokenizer` | `LocalTokenizer` —— `tokenizers` crate，接入同一套校验 |
+| `wire` | `SystemOneResponse`、`Answer`、请求校验、`OrderedMap` |
+
+请求体、响应与答案都是类型化 struct，而不是松散的 JSON 文档：打分请求/响应对、带
+`choice`/`noul`/`score` 枚举的 System One 响应、health 负载，全都是 `Serialize`/`Deserialize`
+类型。`serde_json::Value` 只保留在真正动态的地方——调用方的 `state`、`criteria` 里的值，
+以及 prompt 契约要求逐字节固定的 Python JSON 布局。
+
+## 不依赖运行时端点
+
+不同运行时暴露的辅助端点不一样。桥接层默认把渲染和分词都交给运行时，但这两半可以各自独立地搬到本进程：
+
+| 参数 | 替代 | 用途 |
+|---|---|---|
+| `--chat-template-file` + `--chat-template-context` | `/apply-template` | vLLM 以及没有该端点的运行时 |
+| `--tokenizer-json` | `/tokenize` 与 `/detokenize` | 没有分词端点，或需要完全离线启动 |
+
+```bash
+# 本地渲染，分词仍走运行时
+./target/release/jev-bridge \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen3.5-4B \
+  --served-model bridge-qwen3.5-4b \
+  --served-model-release-date 2026-09-22 \
+  --chat-template-file qwen3.5.chat_template.jinja \
+  --chat-template-context '{"bos_token": "", "eos_token": "<|im_end|>"}'
+
+# 两半都本地：不再需要 /apply-template 和 /tokenize
+./target/release/jev-bridge \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen3.5-4B \
+  --served-model bridge-qwen3.5-4b \
+  --served-model-release-date 2026-09-22 \
+  --chat-template-file qwen3.5.chat_template.jinja \
+  --chat-template-context '{"bos_token": "", "eos_token": "<|im_end|>"}' \
+  --tokenizer-json /models/Qwen3.5-4B/tokenizer.json
+```
+
+务必使用**模型自己的**模板与分词器，不要手写、也不要混用别的模型：词表不对会静默地给错误的
+token id 打分，模板不对会静默地改变 prompt。llama.cpp 服务上两者都能从 `/props` 取到：
+
+```bash
+curl -s "http://127.0.0.1:8080/props?model=$MODEL" | jq -r .chat_template > template.jinja
+```
+
+模板上下文承载 transformers 除 messages 之外提供的变量。以 `{{- bos_token }}` 开头的模板
+必须在这里给出 `bos_token`，否则渲染出的 prompt 会静默地缺少 BOS。
+
+`GET /health` 会报告 `renders_locally` 与 `tokenizes_locally`，可以直接确认桥接层实际协商到的形态。
+
+为 transformers 编写的模板会用到 Python 风格字符串方法（`split`、`replace`、`startswith`、
+`strip` 等），Rust 的 minijinja 并不提供。桥接层按 CPython 语义补齐了它们，包括把
+`strip`/`lstrip`/`rstrip` 的参数当作字符集合而不是前缀。本地渲染已用真实模型模板与
+llama.cpp 自己的 `/apply-template` 输出做过逐字节比对。
+
+## Examples
+
+`examples/` 下有三个可直接运行的示例，配置全部从环境变量读取，没有硬编码任何凭据：
+
+| 示例 | 展示内容 |
+|---|---|
+| `cargo run --example score_rows` | 连接 `Bridge`、给 rows 打分、读取 `DetailedScore` |
+| `cargo run --example serve` | 用 `router` 把同一个 bridge 挂成 HTTP 服务 |
+| `cargo run --example local_template` | 在本地渲染模板并检查渲染出的 prompt |
+
+```bash
+export JEV_BRIDGE_UPSTREAM_URL=http://127.0.0.1:8080/v1
+export JEV_BRIDGE_UPSTREAM_KEY=...        # 仅当服务端需要时
+cargo run --example score_rows
+```
 
 ## 传输探测
 
@@ -264,6 +334,9 @@ token，该传输会被**拒绝**而不是默默采用——否则 `/health` 报
 | `--served-model-description` | `GET /v1/models` 的描述 |
 | `--served-model-release-date` | `GET /v1/models` 的 ISO 日期（必填） |
 | `--chat-template-kwargs` | 渲染模板时透传的参数，默认 `{"enable_thinking": false}` |
+| `--chat-template-file` | 从该 Jinja 文件本地渲染模板，不再调用 `/apply-template` |
+| `--chat-template-context` | 每次本地渲染附加的 JSON，例如 `{"bos_token": "<s>"}` |
+| `--tokenizer-json` | 用该 `tokenizer.json` 本地分词，不再调用 `/tokenize` |
 | `--max-input-tokens` | 超过该 token 数的行直接报错（不做截断） |
 | `--host` / `--port` | 监听地址，默认 `127.0.0.1:8100` |
 | `--api-key` | 客户端必须携带的 bearer token；建议用环境变量 `JEV_BRIDGE_API_KEY` |
@@ -289,15 +362,16 @@ token，该传输会被**拒绝**而不是默默采用——否则 `/health` 报
 cargo test
 ```
 
-39 个测试：26 个单元测试（wire 契约、CPython JSON 布局、三种响应形状、softmax 稳定性、
-缺失选项必须报错），加 13 个集成测试，分在 `tests/bridge.rs`（库 API，含 `DetailedScore`
-字段）和 `tests/contract.rs`（HTTP 层）。
+52 个测试：37 个单元测试（wire 契约、CPython JSON 布局、三种响应形状、softmax 稳定性、
+缺失选项必须报错、CPython 语义的模板方法），加 15 个集成测试，分在 `tests/bridge.rs`
+（库 API，含 `DetailedScore` 字段）和 `tests/contract.rs`（HTTP 层、本地渲染、本地分词）。
 
 ## 已知限制
 
-- 目前只支持服务端渲染模板的运行时（llama.cpp `/apply-template` + `/tokenize`）。
-  对接 vLLM 需要补一条本地 tokenizer + minijinja 渲染路径，尚未实现。
 - 决策串行执行：一次请求内的多个问题逐条打分，上游调用不批量并发。
 - 上游 revision 无法由本进程钉住，结果的可复现性取决于上游自身的版本管理。
 - 对齐验证的参考侧是 BF16，桥接侧是 Q8_0，因此 0.0053 的质量差是量化差，不是桥接差；
   要得到同精度对比需要把上游换成 BF16 服务。
+- 使用本地分词器时，桥接层信任你给的文件。词表不对会从错误的 token id 上算出看似合理的分数。
+  `verify_special_tokens` 会在启动时校验上下文里的特殊 token 是否存在于该词表，但无法判断
+  这个词表是否就是该模型自己的。

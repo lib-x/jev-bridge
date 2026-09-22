@@ -11,18 +11,23 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde_json::{json, Map, Value};
+use serde::Serialize;
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::prompt::{direct_messages, prompt_sha256, softmax, ServerTemplate, LETTERS, PROMPT_VERSION};
+use crate::prompt::{direct_messages, prompt_sha256, softmax, ChatTemplate, LocalComponents, RuntimeClient, LETTERS, PROMPT_VERSION};
 use crate::strategy::{
-    build_body, candidates_restricted_to, parse_candidates, parse_logprobs, request_url, Probe,
+    build_body, candidates_restricted_to, input_tokens, parse_candidates, parse_logprobs,
+    request_url, truncated, CompletionResponse, Probe,
 };
-use crate::wire::{request_rows, response_from_results, Row, ScoredAnswer, PROBABILITY_STATUS};
+use crate::wire::{
+    request_rows, response_from_results, OrderedMap, Row, ScoredAnswer, PROBABILITY_STATUS,
+};
 
 /// One configured bridge over a single upstream model.
-pub struct Bridge {    client: reqwest::Client,
-    template: ServerTemplate,
+pub struct Bridge {
+    client: reqwest::Client,
+    template: ChatTemplate,
     probe: Probe,
     upstream_model: String,
     upstream_key: Option<String>,
@@ -47,6 +52,9 @@ pub struct BridgeConfig {
     pub release_date: String,
     pub chat_template_kwargs: Value,
     pub max_input_tokens: Option<usize>,
+    /// Render the chat template and/or tokenize in-process instead of asking
+    /// the runtime.
+    pub local: LocalComponents,
 }
 
 /// A scored row plus the evidence needed to compare a bridged run against a
@@ -60,12 +68,16 @@ pub struct DetailedScore {
 
 impl Bridge {
     /// Resolve the prompt contract and pick a transport, or fail with reasons.
-    pub async fn connect(client: reqwest::Client, config: BridgeConfig) -> Result<Self> {
-        let template = ServerTemplate::new(
+    pub async fn connect(client: reqwest::Client, mut config: BridgeConfig) -> Result<Self> {
+        let runtime = RuntimeClient::new(
             client.clone(),
             config.native_base.clone(),
             config.upstream_model.clone(),
             config.upstream_key.clone(),
+        );
+        let template = ChatTemplate::new(
+            runtime,
+            std::mem::take(&mut config.local),
             config.chat_template_kwargs.clone(),
         );
 
@@ -154,6 +166,16 @@ impl Bridge {
         self.template.chat_template_kwargs()
     }
 
+    /// Whether the prompt is rendered in-process rather than by the runtime.
+    pub fn renders_locally(&self) -> bool {
+        self.template.renders_locally()
+    }
+
+    /// Whether tokenization happens in-process rather than by the runtime.
+    pub fn tokenizes_locally(&self) -> bool {
+        self.template.tokenizes_locally()
+    }
+
     /// Score every row of one request against the same upstream model.
     pub async fn score_rows(&self, rows: &[Row]) -> Result<Vec<DetailedScore>> {
         let _guard = self.lock.lock().await;
@@ -177,9 +199,10 @@ impl Bridge {
         let letters: Vec<char> = LETTERS.chars().take(count).collect();
         let body = build_body(self.probe, &self.upstream_model, &prompt, slots);
         let url = request_url(self.probe, &self.openai_base, &self.native_base);
-        let response = post_json(&self.client, &url, &body, self.upstream_key.as_deref()).await?;
+        let response: CompletionResponse =
+            post_json(&self.client, &url, &body, self.upstream_key.as_deref()).await?;
 
-        if upstream_truncated(self.probe, &response) {
+        if truncated(self.probe, &response) {
             bail!(
                 "row {:?}: the upstream runtime truncated the prompt; shorten the state or raise \
                  its context size",
@@ -224,7 +247,7 @@ async fn try_probe(
 ) -> Result<()> {
     let body = build_body(probe, &config.upstream_model, prompt, slots);
     let url = request_url(probe, &config.openai_base, &config.native_base);
-    let response = post_json(client, &url, &body, config.upstream_key.as_deref()).await?;
+    let response: CompletionResponse = post_json(client, &url, &body, config.upstream_key.as_deref()).await?;
     let logprobs = parse_logprobs(probe, &response, slots, letters)?;
     crate::strategy::validate_probe(&logprobs)?;
     if probe.restricts_distribution() {
@@ -239,12 +262,17 @@ async fn try_probe(
     Ok(())
 }
 
-pub async fn post_json(
+/// POST a typed request body and decode a typed response.
+///
+/// The bridge always knows which shape it expects, so the response is decoded
+/// into a struct instead of being poked at as a generic document; a server that
+/// answers with something else fails here rather than later.
+pub async fn post_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
-    body: &Value,
+    body: &(impl serde::Serialize + ?Sized),
     api_key: Option<&str>,
-) -> Result<Value> {
+) -> Result<T> {
     let mut request = client.post(url).json(body);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
@@ -264,31 +292,12 @@ pub async fn post_json(
             text.chars().take(400).collect::<String>()
         );
     }
-    serde_json::from_str(&text)
-        .with_context(|| format!("POST {url} returned a non-JSON body: {}", text.chars().take(400).collect::<String>()))
-}
-
-fn input_tokens(probe: Probe, response: &Value) -> u64 {
-    match probe {
-        Probe::LlamaCppNProbs => response
-            .get("tokens_evaluated")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        _ => response
-            .pointer("/usage/prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-    }
-}
-
-fn upstream_truncated(probe: Probe, response: &Value) -> bool {
-    match probe {
-        Probe::LlamaCppNProbs => response
-            .get("truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        _ => false,
-    }
+    serde_json::from_str(&text).with_context(|| {
+        format!(
+            "POST {url} returned an unexpected body: {}",
+            text.chars().take(400).collect::<String>()
+        )
+    })
 }
 
 /// Shared HTTP state.
@@ -335,17 +344,49 @@ async fn systemone(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
     }
 }
 
+/// One entry in `GET /v1/models`.
+#[derive(Debug, Serialize)]
+struct ModelEntry {
+    name: String,
+    description: String,
+    release_date: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelsResponse {
+    models: Vec<ModelEntry>,
+}
+
+/// What the bridge negotiated, exposed so an operator can see it rather than
+/// guess which transport is in use.
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    served_model: String,
+    upstream_model: String,
+    probe: &'static str,
+    probe_note: &'static str,
+    endpoint: &'static str,
+    prompt_version: &'static str,
+    /// The resolved token id of every answer letter.
+    answer_slots: OrderedMap<u32>,
+    chat_template_kwargs: Value,
+    renders_locally: bool,
+    tokenizes_locally: bool,
+    probability_status: &'static str,
+}
+
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(response) = authorize(&state, &headers) {
         return response;
     }
-    Json(json!({
-        "models": [{
-            "name": state.bridge.served_model,
-            "description": state.bridge.description,
-            "release_date": state.bridge.release_date,
-        }]
-    }))
+    Json(ModelsResponse {
+        models: vec![ModelEntry {
+            name: state.bridge.served_model.clone(),
+            description: state.bridge.description.clone(),
+            release_date: state.bridge.release_date.clone(),
+        }],
+    })
     .into_response()
 }
 
@@ -353,23 +394,24 @@ async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if let Err(response) = authorize(&state, &headers) {
         return response;
     }
-    let slots: Map<String, Value> = LETTERS
-        .chars()
-        .zip(state.bridge.slots())
-        .map(|(letter, id)| (letter.to_string(), Value::from(*id)))
-        .collect();
-    Json(json!({
-        "status": "ok",
-        "served_model": state.bridge.served_model,
-        "upstream_model": state.bridge.upstream_model,
-        "probe": state.bridge.probe().name(),
-        "probe_note": state.bridge.probe().note(),
-        "endpoint": state.bridge.probe().endpoint(),
-        "prompt_version": PROMPT_VERSION,
-        "answer_slots": slots,
-        "chat_template_kwargs": state.bridge.chat_template_kwargs(),
-        "probability_status": PROBABILITY_STATUS,
-    }))
+    let mut answer_slots = OrderedMap::new();
+    for (letter, id) in LETTERS.chars().zip(state.bridge.slots()) {
+        answer_slots.insert(letter.to_string(), *id);
+    }
+    Json(HealthResponse {
+        status: "ok",
+        served_model: state.bridge.served_model.clone(),
+        upstream_model: state.bridge.upstream_model().to_string(),
+        probe: state.bridge.probe().name(),
+        probe_note: state.bridge.probe().note(),
+        endpoint: state.bridge.probe().endpoint(),
+        prompt_version: PROMPT_VERSION,
+        answer_slots,
+        chat_template_kwargs: state.bridge.chat_template_kwargs(),
+        renders_locally: state.bridge.renders_locally(),
+        tokenizes_locally: state.bridge.tokenizes_locally(),
+        probability_status: PROBABILITY_STATUS,
+    })
     .into_response()
 }
 

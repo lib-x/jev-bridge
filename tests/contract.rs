@@ -9,6 +9,7 @@ mod common;
 use serde_json::json;
 
 use common::{
+    connect_with, minimal_tokenizer_json,
     connect, sixteen_option_payload, slot_for, spawn_upstream, systemone_payload,
     three_kind_payload, two_question_payload, RunningBridge, UpstreamConfig, LETTERS,
 };
@@ -138,6 +139,79 @@ async fn bearer_auth_is_enforced_when_configured() {
     assert_eq!(bridge.get("/health", None).await.0, 401);
     assert_eq!(bridge.get("/health", Some("wrong-token")).await.0, 401);
     assert_eq!(bridge.get("/health", Some("secret-token")).await.0, 200);
+}
+
+// --------------------------------------------------------------------------
+// in-process components
+// --------------------------------------------------------------------------
+
+#[cfg(feature = "local-tokenizer")]
+#[tokio::test]
+async fn a_local_tokenizer_replaces_the_runtime_endpoint() {
+    use jev_bridge::prompt::LocalComponents;
+    use jev_bridge::tokenizer::LocalTokenizer;
+
+    // This mock publishes no /tokenize at all, so a bridge that still called it
+    // could not even resolve its answer slots.
+    let upstream = spawn_upstream(UpstreamConfig {
+        tokenize: false,
+        ..Default::default()
+    })
+    .await;
+    let tokenizer = LocalTokenizer::from_bytes(&minimal_tokenizer_json())
+        .expect("the minimal tokenizer should load");
+    let bridge = connect_with(
+        &upstream,
+        LocalComponents {
+            tokenizer: Some(tokenizer),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a local tokenizer should make the bridge independent of /tokenize");
+
+    assert!(bridge.tokenizes_locally());
+    assert!(!bridge.renders_locally());
+
+    let bridge = RunningBridge::serve(bridge, None).await;
+    let payload = systemone_payload("I was charged twice.", two_question_payload(), "bridge-mock");
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["answers"]["department"]["choice"], "billing");
+    assert_eq!(body["usage"]["output_tokens"], 0);
+}
+
+#[tokio::test]
+async fn a_local_renderer_replaces_the_runtime_template_endpoint() {
+    use jev_bridge::prompt::LocalComponents;
+    use jev_bridge::render::LocalRenderer;
+
+    // The mock's /apply-template is still registered, but the local renderer
+    // must win: its output is what the mock upstream would not have produced.
+    let upstream = spawn_upstream(UpstreamConfig::default()).await;
+    let renderer = LocalRenderer::new(
+        format!("LOCAL{}", "{{ messages[0].content }}"),
+        serde_json::Map::new(),
+    )
+    .unwrap();
+    let bridge = connect_with(
+        &upstream,
+        LocalComponents {
+            renderer: Some(renderer),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a local renderer should connect against the mock");
+
+    assert!(bridge.renders_locally());
+
+    let bridge = RunningBridge::serve(bridge, None).await;
+    let (status, health) = bridge.get("/health", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(health["renders_locally"], true);
+    assert_eq!(health["tokenizes_locally"], false);
 }
 
 // --------------------------------------------------------------------------

@@ -29,6 +29,9 @@ pub struct UpstreamConfig {
     pub letters: usize,
     pub single_token: bool,
     pub foreign_tokens: bool,
+    /// When false, `/tokenize` answers 404, which proves a bridge configured
+    /// with a local tokenizer never calls it.
+    pub tokenize: bool,
 }
 
 impl Default for UpstreamConfig {
@@ -37,17 +40,67 @@ impl Default for UpstreamConfig {
             letters: 16,
             single_token: true,
             foreign_tokens: true,
+            tokenize: true,
         }
     }
+}
+
+/// A tiny but valid `tokenizer.json` whose answer letters are single tokens.
+///
+/// The ids match the ones the mock upstream publishes (A=54 … P=69) so the two
+/// halves of a test agree without pretending to be a real model vocabulary.
+pub fn minimal_tokenizer_json() -> Vec<u8> {
+    let mut vocab = serde_json::Map::new();
+    vocab.insert("<unk>".to_string(), json!(0));
+    for (index, letter) in LETTERS.chars().enumerate() {
+        vocab.insert(letter.to_string(), json!(54 + index));
+    }
+    for (index, byte) in (32u8..127).enumerate() {
+        let character = (byte as char).to_string();
+        if !vocab.contains_key(&character) {
+            vocab.insert(character, json!(200 + index));
+        }
+    }
+    serde_json::to_vec(&json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        // Split on every character so appending a letter cannot change the
+        // tokenization of what precedes it — the property the bridge checks.
+        "pre_tokenizer": {
+            "type": "Split",
+            "pattern": {"Regex": "[\\s\\S]"},
+            "behavior": "Isolated",
+            "invert": false
+        },        "post_processor": null,
+        // Any decoder makes tokenizers join tokens without a separator; the
+        // replacement itself is a no-op for single-character tokens.
+        "decoder": {"type": "Replace", "pattern": {"String": " "}, "content": ""},
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}
+    }))
+    .unwrap()
 }
 
 async fn apply_template() -> Json<Value> {
     Json(json!({"prompt": MOCK_PROMPT}))
 }
 
-async fn tokenize(State(config): State<UpstreamConfig>, Json(body): Json<Value>) -> Json<Value> {
+async fn tokenize(
+    State(config): State<UpstreamConfig>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !config.tokenize {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": "this mock has no tokenize endpoint"})),
+        )
+            .into_response();
+    }
     if !config.single_token {
-        return Json(json!({"tokens": [1, 2]}));
+        return Json(json!({"tokens": [1, 2]})).into_response();
     }
     let content = body.get("content").and_then(Value::as_str).unwrap_or_default();
     let tokens: Vec<u32> = match content.strip_prefix(MOCK_PROMPT) {
@@ -57,9 +110,19 @@ async fn tokenize(State(config): State<UpstreamConfig>, Json(body): Json<Value>)
             ids.push(slot_for(tail.chars().next().unwrap()));
             ids
         }
-        None => content.chars().map(slot_for).collect(),
+        None => content
+            .chars()
+            .map(|character| {
+                if LETTERS.contains(character) {
+                    slot_for(character)
+                } else {
+                    // Any stable id will do; these tests never assert on it.
+                    300 + (character as u32 % 100)
+                }
+            })
+            .collect(),
     };
-    Json(json!({"tokens": tokens}))
+    Json(json!({"tokens": tokens})).into_response()
 }
 
 async fn detokenize() -> Json<Value> {
@@ -137,11 +200,23 @@ pub fn config_for(upstream: &str) -> BridgeConfig {
         release_date: RELEASE_DATE.to_string(),
         chat_template_kwargs: json!({"enable_thinking": false}),
         max_input_tokens: None,
+        local: Default::default(),
     }
 }
 
 pub async fn connect(upstream: &str) -> anyhow::Result<Bridge> {
     Bridge::connect(reqwest::Client::new(), config_for(upstream)).await
+}
+
+/// Connect with in-process components, for the local-rendering and
+/// local-tokenization paths.
+pub async fn connect_with(
+    upstream: &str,
+    local: jev_bridge::prompt::LocalComponents,
+) -> anyhow::Result<Bridge> {
+    let mut config = config_for(upstream);
+    config.local = local;
+    Bridge::connect(reqwest::Client::new(), config).await
 }
 
 /// A bridge served over HTTP, for contract tests that speak the wire format.

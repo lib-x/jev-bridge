@@ -5,26 +5,38 @@
 //! through the model's own chat template with thinking disabled, then scored
 //! by reading the next-token logits of the fixed uppercase answer letters.
 //!
-//! Rendering is delegated to the serving runtime (`/apply-template` on
-//! llama.cpp) rather than reproduced locally. That keeps the prompt byte
-//! identical to what the runtime itself would feed the model, which is the
-//! property the whole readout depends on.
+//! Rendering can come from two places. By default the serving runtime renders
+//! it (`/apply-template` on llama.cpp), which guarantees the prompt is exactly
+//! what that runtime feeds the model. When the runtime exposes no such endpoint
+//! — vLLM, for instance — [`crate::render::LocalRenderer`] renders the same
+//! template in-process instead.
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::render::LocalRenderer;
 use crate::wire::{to_python_json, RowOption};
+#[cfg(feature = "local-tokenizer")]
+use crate::tokenizer::LocalTokenizer;
 
 pub const LETTERS: &str = "ABCDEFGHIJKLMNOP";
 pub const DIRECT_SYSTEM: &str = "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase letter, with no explanation or reasoning.";
 pub const PROMPT_VERSION: &str = "direct-options-v1";
 
+/// One chat message, in the shape every chat template expects.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatMessage {
+    pub role: &'static str,
+    pub content: String,
+}
+
 /// Build the chat messages for one decision.
 ///
 /// The payload uses Python's JSON layout so the text matches the reference
 /// implementation byte for byte.
-pub fn direct_messages(state: &Value, question: &str, options: &[RowOption]) -> Value {
+pub fn direct_messages(state: &Value, question: &str, options: &[RowOption]) -> Vec<ChatMessage> {
     let entries: Vec<Value> = options
         .iter()
         .enumerate()
@@ -40,10 +52,16 @@ pub fn direct_messages(state: &Value, question: &str, options: &[RowOption]) -> 
         "criterion": question,
         "options": entries,
     });
-    json!([
-        {"role": "system", "content": DIRECT_SYSTEM},
-        {"role": "user", "content": to_python_json(&payload)},
-    ])
+    vec![
+        ChatMessage {
+            role: "system",
+            content: DIRECT_SYSTEM.to_string(),
+        },
+        ChatMessage {
+            role: "user",
+            content: to_python_json(&payload),
+        },
+    ]
 }
 
 /// SHA-256 of the rendered prompt.
@@ -57,45 +75,86 @@ pub fn prompt_sha256(prompt: &str) -> String {
 }
 
 /// Softmax over the selected option logits, matching fastjev's helper.
-pub fn softmax(values: &[f64]) -> Vec<f64> {    let maximum = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+pub fn softmax(values: &[f64]) -> Vec<f64> {
+    let maximum = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let weights: Vec<f64> = values.iter().map(|value| (value - maximum).exp()).collect();
     let total: f64 = weights.iter().sum();
     weights.iter().map(|weight| weight / total).collect()
 }
 
-/// Chat-template rendering and tokenization delegated to the serving runtime.
-pub struct ServerTemplate {
+/// The body of a `/apply-template` call.
+#[derive(Debug, Serialize)]
+struct ApplyTemplateRequest<'a> {
+    model: &'a str,
+    messages: &'a [ChatMessage],
+    /// Template variables such as `enable_thinking`, forwarded verbatim.
+    chat_template_kwargs: &'a Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyTemplateResponse {
+    prompt: String,
+}
+
+/// The body of a `/tokenize` call.
+#[derive(Debug, Serialize)]
+struct TokenizeRequest<'a> {
+    model: &'a str,
+    content: &'a str,
+    /// The template already emits BOS, so tokenizing must not add another.
+    add_special: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenizeResponse {
+    tokens: Vec<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct DetokenizeRequest<'a> {
+    model: &'a str,
+    tokens: &'a [u32],
+}
+
+#[derive(Debug, Deserialize)]
+struct DetokenizeResponse {
+    content: String,
+}
+
+/// HTTP access to the serving runtime.
+///
+/// Tokenization always goes through the runtime unless a local tokenizer is
+/// configured, so the bridge never needs a copy of the model's vocabulary.
+/// Rendering goes through it too unless a local renderer is configured.
+pub struct RuntimeClient {
     client: reqwest::Client,
     base: String,
     model: String,
     api_key: Option<String>,
-    chat_template_kwargs: Value,
 }
 
-impl ServerTemplate {
+impl RuntimeClient {
     pub fn new(
         client: reqwest::Client,
         base: impl Into<String>,
         model: impl Into<String>,
         api_key: Option<String>,
-        chat_template_kwargs: Value,
     ) -> Self {
         Self {
             client,
             base: base.into().trim_end_matches('/').to_string(),
             model: model.into(),
             api_key,
-            chat_template_kwargs,
         }
     }
 
-    pub fn chat_template_kwargs(&self) -> Value {
-        self.chat_template_kwargs.clone()
-    }
-
-    async fn post(&self, path: &str, body: Value) -> Result<Value> {
+    async fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &(impl serde::Serialize + ?Sized),
+    ) -> Result<T> {
         let url = format!("{}{path}", self.base);
-        let mut request = self.client.post(&url).json(&body);
+        let mut request = self.client.post(&url).json(body);
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
         }
@@ -112,47 +171,117 @@ impl ServerTemplate {
             bail!("POST {url} returned HTTP {status}: {}", truncate(&text));
         }
         serde_json::from_str(&text)
-            .with_context(|| format!("POST {url} returned a non-JSON body: {}", truncate(&text)))
+            .with_context(|| format!("POST {url} returned an unexpected body: {}", truncate(&text)))
     }
 
     /// Render messages with the runtime's own chat template.
-    pub async fn render(&self, messages: &Value) -> Result<String> {
-        let body = json!({
-            "model": self.model,
-            "messages": messages,
-            "chat_template_kwargs": self.chat_template_kwargs,
-        });
-        let response = self
-            .post("/apply-template", body)
+    pub async fn apply_template(
+        &self,
+        messages: &[ChatMessage],
+        chat_template_kwargs: &Value,
+    ) -> Result<String> {
+        let body = ApplyTemplateRequest {
+            model: &self.model,
+            messages,
+            chat_template_kwargs,
+        };
+        let response: ApplyTemplateResponse = self
+            .post("/apply-template", &body)
             .await
             .context("rendering the chat template on the serving runtime failed")?;
-        response
-            .get("prompt")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("/apply-template response has no prompt string"))
+        Ok(response.prompt)
     }
 
     pub async fn tokenize(&self, content: &str) -> Result<Vec<u32>> {
-        let body = json!({
-            "model": self.model,
-            "content": content,
-            "add_special": false,
-        });
-        let response = self.post("/tokenize", body).await?;
-        let tokens = response
-            .get("tokens")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("/tokenize response has no tokens array"))?;
-        tokens
-            .iter()
-            .map(|token| {
-                token
-                    .as_u64()
-                    .and_then(|value| u32::try_from(value).ok())
-                    .ok_or_else(|| anyhow::anyhow!("/tokenize returned a non-integer token id"))
-            })
-            .collect()
+        let body = TokenizeRequest {
+            model: &self.model,
+            content,
+            add_special: false,
+        };
+        let response: TokenizeResponse = self.post("/tokenize", &body).await?;
+        Ok(response.tokens)
+    }
+
+    pub async fn detokenize(&self, tokens: &[u32]) -> Result<String> {
+        let body = DetokenizeRequest {
+            model: &self.model,
+            tokens,
+        };
+        let response: DetokenizeResponse = self.post("/detokenize", &body).await?;
+        Ok(response.content)
+    }
+}
+
+/// The work the bridge can do without asking the serving runtime.
+///
+/// Both fields are optional and independent: a runtime may render templates but
+/// not tokenize, or the other way round. Anything left unset falls back to the
+/// runtime's own endpoints.
+#[derive(Default)]
+pub struct LocalComponents {
+    pub renderer: Option<LocalRenderer>,
+    #[cfg(feature = "local-tokenizer")]
+    pub tokenizer: Option<LocalTokenizer>,
+}
+
+/// The prompt contract: rendering, tokenization, and the startup checks.
+pub struct ChatTemplate {
+    runtime: RuntimeClient,
+    local: LocalComponents,
+    chat_template_kwargs: Value,
+}
+
+impl ChatTemplate {
+    pub fn new(runtime: RuntimeClient, local: LocalComponents, chat_template_kwargs: Value) -> Self {
+        Self {
+            runtime,
+            local,
+            chat_template_kwargs,
+        }
+    }
+
+    /// Whether the prompt is rendered in this process rather than by the runtime.
+    pub fn renders_locally(&self) -> bool {
+        self.local.renderer.is_some()
+    }
+
+    /// Whether tokenization happens in this process rather than by the runtime.
+    pub fn tokenizes_locally(&self) -> bool {
+        #[cfg(feature = "local-tokenizer")]
+        {
+            self.local.tokenizer.is_some()
+        }
+        #[cfg(not(feature = "local-tokenizer"))]
+        {
+            false
+        }
+    }
+
+    pub async fn render(&self, messages: &[ChatMessage]) -> Result<String> {
+        match &self.local.renderer {
+            Some(local) => local.render(messages, &self.chat_template_kwargs),
+            None => {
+                self.runtime
+                    .apply_template(messages, &self.chat_template_kwargs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn tokenize(&self, content: &str) -> Result<Vec<u32>> {
+        #[cfg(feature = "local-tokenizer")]
+        if let Some(local) = &self.local.tokenizer {
+            return local.tokenize(content);
+        }
+        self.runtime.tokenize(content).await
+    }
+
+    pub async fn detokenize(&self, tokens: &[u32]) -> Result<String> {
+        #[cfg(feature = "local-tokenizer")]
+        if let Some(local) = &self.local.tokenizer {
+            return local.detokenize(tokens);
+        }
+        self.runtime.detokenize(tokens).await
     }
 
     /// Resolve the sixteen answer slots and prove they are exact single tokens.
@@ -179,15 +308,11 @@ impl ServerTemplate {
             bail!("answer-slot tokens collide");
         }
         let decoded = self
-            .post("/detokenize", json!({"model": self.model, "tokens": slots}))
+            .detokenize(&slots)
             .await
             .context("verifying answer-slot round trip failed")?;
-        let text = decoded
-            .get("content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("/detokenize response has no content string"))?;
-        if text != LETTERS {
-            bail!("answer slots decode to {text:?} instead of {LETTERS:?}");
+        if decoded != LETTERS {
+            bail!("answer slots decode to {decoded:?} instead of {LETTERS:?}");
         }
         Ok(slots)
     }
@@ -214,6 +339,10 @@ impl ServerTemplate {
         }
         Ok(())
     }
+
+    pub fn chat_template_kwargs(&self) -> Value {
+        self.chat_template_kwargs.clone()
+    }
 }
 
 fn truncate(text: &str) -> String {
@@ -227,30 +356,40 @@ fn truncate(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Map;
 
     fn options() -> Vec<RowOption> {
         vec![
-            RowOption { id: "billing".into(), description: "Billing and refunds.".into() },
-            RowOption { id: "sales".into(), description: "Pricing and contracts.".into() },
+            RowOption {
+                id: "billing".into(),
+                description: "Billing and refunds.".into(),
+            },
+            RowOption {
+                id: "sales".into(),
+                description: "Pricing and contracts.".into(),
+            },
         ]
     }
 
     #[test]
     fn payload_matches_python_json_layout() {
         let messages = direct_messages(&json!("charged twice"), "Which queue?", &options());
-        let user = messages[1]["content"].as_str().unwrap();
+        let user = messages[1].content.as_str();
         assert_eq!(
             user,
             r#"{"evidence": "charged twice", "criterion": "Which queue?", "options": [{"letter": "A", "description": "Billing and refunds."}, {"letter": "B", "description": "Pricing and contracts."}]}"#
         );
-        assert_eq!(messages[0]["content"], DIRECT_SYSTEM);
+        assert_eq!(messages[0].content, DIRECT_SYSTEM);
     }
 
     #[test]
     fn structured_state_is_embedded_as_json() {
         let messages = direct_messages(&json!({"message": "hi", "count": 2}), "q", &options());
-        let user = messages[1]["content"].as_str().unwrap();
-        assert!(user.contains(r#""evidence": {"message": "hi", "count": 2}"#), "{user}");
+        let user = messages[1].content.as_str();
+        assert!(
+            user.contains(r#""evidence": {"message": "hi", "count": 2}"#),
+            "{user}"
+        );
     }
 
     #[test]
@@ -273,5 +412,35 @@ mod tests {
         let probabilities = softmax(&[-12.320333, -0.0000213, -15.617624]);
         assert!(probabilities[1] > 0.9999, "{probabilities:?}");
         assert!(probabilities[0] < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn a_local_renderer_takes_precedence_over_the_runtime() {
+        let runtime = RuntimeClient::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".to_string(),
+            "unreachable".to_string(),
+            None,
+        );
+        let local = LocalRenderer::new(
+            "local:{{ messages[0].content }}:{{ enable_thinking }}".to_string(),
+            Map::new(),
+        )
+        .unwrap();
+        let template = ChatTemplate::new(
+            runtime,
+            LocalComponents {
+                renderer: Some(local),
+                ..Default::default()
+            },
+            json!({"enable_thinking": false}),
+        );
+
+        assert!(template.renders_locally());
+        let messages = direct_messages(&json!("state"), "question", &options());
+        // No HTTP call happens, so the unreachable base URL never matters.
+        let rendered = template.render(&messages).await.unwrap();
+        assert!(rendered.starts_with("local:"), "{rendered}");
+        assert!(rendered.ends_with(":False"), "{rendered}");
     }
 }

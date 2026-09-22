@@ -29,6 +29,9 @@
 //! The `jev-bridge` binary is a thin CLI over [`server::Bridge`].
 
 pub mod prompt;
+pub mod render;
 pub mod server;
 pub mod strategy;
+#[cfg(feature = "local-tokenizer")]
+pub mod tokenizer;
 pub mod wire;

@@ -12,8 +12,9 @@
 //!   * An unrestricted top-k needs k >= 50 before all sixteen answer letters
 //!     appear, so unrestricted probes request a generous k.
 
-use anyhow::{anyhow, bail, Result};
-use serde_json::{json, Value};
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// How the target service exposes option-token log probabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,49 +104,115 @@ fn top_k(probe: Probe, slot_count: usize) -> usize {
     }
 }
 
-pub fn build_body(probe: Probe, model: &str, prompt: &str, slots: &[u32]) -> Value {
+/// The request body for an OpenAI-compatible `/v1/completions` call.
+///
+/// Optional fields are omitted rather than sent as `null`: a runtime that does
+/// not know `allowed_token_ids` is likelier to answer a request without it, and
+/// the probe already checks whether the field had any effect.
+#[derive(Debug, Serialize)]
+pub struct OpenAiCompletionRequest {
+    model: String,
+    prompt: String,
+    /// One token is enough: only the first position's distribution is read.
+    max_tokens: u32,
+    /// Left at 1.0 so the returned log probabilities are the model's own.
+    temperature: f32,
+    /// How many candidates to return from the head of the distribution.
+    logprobs: usize,
+    /// Ask vLLM to label candidates by token id instead of token text, which
+    /// removes any ambiguity about leading spaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    return_tokens_as_token_ids: Option<bool>,
+    /// vLLM extension: restrict sampling to these token ids, which turns the
+    /// returned log probabilities into the conditional option distribution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_token_ids: Option<Vec<u32>>,
+    /// vLLM extension: report these exact token ids even when they fall
+    /// outside the top-k.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprob_token_ids: Option<Vec<u32>>,
+}
+
+/// The request body for llama.cpp's native `/completion`.
+///
+/// Every sampler knob is set explicitly and neutrally. llama.cpp reports the
+/// distribution *after* the sampler chain, so inheriting a server preset such
+/// as `repeat-penalty = 1.05` or `top-p = 0.85` would return a distorted
+/// distribution instead of the model's own.
+#[derive(Debug, Serialize)]
+pub struct LlamaCppCompletionRequest {
+    model: String,
+    prompt: String,
+    n_predict: u32,
+    /// How many candidates to return, matching `logprobs` above.
+    n_probs: usize,
+    cache_prompt: bool,
+    temperature: f32,
+    /// 0 disables top-k truncation.
+    top_k: i32,
+    top_p: f32,
+    min_p: f32,
+    repeat_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    typical_p: f32,
+}
+
+/// A scoring request in whichever dialect the chosen probe speaks.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum RequestBody {
+    OpenAi(OpenAiCompletionRequest),
+    LlamaCpp(LlamaCppCompletionRequest),
+}
+
+pub fn build_body(probe: Probe, model: &str, prompt: &str, slots: &[u32]) -> RequestBody {
+    let candidates = top_k(probe, slots.len());
     match probe {
-        Probe::LogprobTokenIds => json!({
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": 1,
-            "temperature": 1.0,
-            "logprobs": 1,
-            "return_tokens_as_token_ids": true,
-            "allowed_token_ids": slots,
-            "logprob_token_ids": slots,
+        Probe::LogprobTokenIds => RequestBody::OpenAi(OpenAiCompletionRequest {
+            model: model.to_string(),
+            prompt: prompt.to_string(),
+            max_tokens: 1,
+            temperature: 1.0,
+            logprobs: candidates,
+            return_tokens_as_token_ids: Some(true),
+            allowed_token_ids: Some(slots.to_vec()),
+            logprob_token_ids: Some(slots.to_vec()),
         }),
-        Probe::AllowedTokenIdsTopK => json!({
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": 1,
-            "temperature": 1.0,
-            "logprobs": top_k(probe, slots.len()),
-            "return_tokens_as_token_ids": true,
-            "allowed_token_ids": slots,
+        Probe::AllowedTokenIdsTopK => RequestBody::OpenAi(OpenAiCompletionRequest {
+            model: model.to_string(),
+            prompt: prompt.to_string(),
+            max_tokens: 1,
+            temperature: 1.0,
+            logprobs: candidates,
+            return_tokens_as_token_ids: Some(true),
+            allowed_token_ids: Some(slots.to_vec()),
+            logprob_token_ids: None,
         }),
-        Probe::CompletionsTopK => json!({
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": 1,
-            "temperature": 1.0,
-            "logprobs": top_k(probe, slots.len()),
-            "return_tokens_as_token_ids": true,
+        Probe::CompletionsTopK => RequestBody::OpenAi(OpenAiCompletionRequest {
+            model: model.to_string(),
+            prompt: prompt.to_string(),
+            max_tokens: 1,
+            temperature: 1.0,
+            logprobs: candidates,
+            return_tokens_as_token_ids: Some(true),
+            allowed_token_ids: None,
+            logprob_token_ids: None,
         }),
-        Probe::LlamaCppNProbs => json!({
-            "model": model,
-            "prompt": prompt,
-            "n_predict": 1,
-            "n_probs": top_k(probe, slots.len()),
-            "cache_prompt": true,
-            "temperature": 1.0,
-            "top_k": 0,
-            "top_p": 1.0,
-            "min_p": 0.0,
-            "repeat_penalty": 1.0,
-            "presence_penalty": 0.0,
-            "frequency_penalty": 0.0,
-            "typical_p": 1.0,
+        Probe::LlamaCppNProbs => RequestBody::LlamaCpp(LlamaCppCompletionRequest {
+            model: model.to_string(),
+            prompt: prompt.to_string(),
+            n_predict: 1,
+            n_probs: candidates,
+            cache_prompt: true,
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            typical_p: 1.0,
         }),
     }
 }
@@ -162,7 +229,100 @@ pub struct Candidate {
     pub logprob: f64,
 }
 
-fn as_logprob(value: &Value) -> Option<f64> {
+/// One candidate as a runtime serialised it.
+///
+/// llama.cpp sends an array of these on both endpoints, with an explicit `id`
+/// and a `logprob`; older builds send `prob` instead. Everything is optional
+/// because the bridge must report a *missing* candidate rather than default one.
+#[derive(Debug, Clone, Deserialize)]
+struct CandidateEntry {
+    #[serde(default)]
+    id: Option<u32>,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    logprob: Option<f64>,
+    #[serde(default)]
+    prob: Option<f64>,
+}
+
+/// A position's candidates, in whichever shape the runtime uses.
+///
+/// OpenAI and vLLM return a map from token text — or `token_id:<n>` when
+/// `return_tokens_as_token_ids` is honoured — to a log probability. llama.cpp
+/// returns an array of entries. Both are accepted, and the map's values stay
+/// dynamic because they may be a bare number or an object with a `logprob`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CandidateList {
+    Entries(Vec<CandidateEntry>),
+    Map(serde_json::Map<String, Value>),
+}
+
+/// One generated position on llama.cpp's native `/completion`.
+#[derive(Debug, Deserialize)]
+struct NativePosition {
+    #[serde(default)]
+    top_logprobs: Option<CandidateList>,
+    /// Only consulted when `top_logprobs` is absent: a probability carries less
+    /// precision than a log probability.
+    #[serde(default)]
+    top_probs: Option<CandidateList>,
+}
+
+/// One generated position in an OpenAI-shaped choice.
+#[derive(Debug, Deserialize)]
+struct ChoiceLogprobs {
+    /// OpenAI completions shape: one entry per generated position.
+    #[serde(default)]
+    top_logprobs: Vec<CandidateList>,
+    /// llama.cpp answers the completions endpoint with chat-shaped content.
+    #[serde(default)]
+    content: Vec<NativePosition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Choice {
+    #[serde(default)]
+    finish_reason: Option<String>,
+    #[serde(default)]
+    logprobs: Option<ChoiceLogprobs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+}
+
+/// Every field the bridge reads from a scoring response.
+///
+/// One struct covers both endpoints: a runtime fills the fields its dialect
+/// uses and leaves the rest absent, and the probe that was chosen already
+/// decided which fields to read.
+#[derive(Debug, Deserialize)]
+pub struct CompletionResponse {
+    #[serde(default)]
+    choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<Usage>,
+    /// llama.cpp native `/completion`.
+    #[serde(default)]
+    completion_probabilities: Vec<NativePosition>,
+    #[serde(default)]
+    tokens_evaluated: Option<u64>,
+    #[serde(default)]
+    truncated: bool,
+}
+
+fn candidate_logprob(entry: &CandidateEntry) -> Option<f64> {
+    entry
+        .logprob
+        .or_else(|| entry.prob.map(f64::ln))
+        .filter(|value| value.is_finite())
+}
+
+fn map_logprob(value: &Value) -> Option<f64> {
     if let Some(number) = value.as_f64() {
         return Some(number);
     }
@@ -172,33 +332,23 @@ fn as_logprob(value: &Value) -> Option<f64> {
         .or_else(|| value.get("prob").and_then(Value::as_f64).map(f64::ln))
 }
 
-fn candidate_from_entry(entry: &Value) -> Option<Candidate> {
-    let id = entry
-        .get("id")
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok());
-    let token = entry
-        .get("token")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let logprob = entry.get("logprob").and_then(Value::as_f64).or_else(|| {
-        entry
-            .get("prob")
-            .and_then(Value::as_f64)
-            .map(f64::ln)
-    })?;
-    Some(Candidate { id, token, logprob })
-}
-
 /// Normalize the several shapes servers use for one position's candidates.
-fn collect_candidates(value: &Value) -> Vec<Candidate> {
-    match value {
-        Value::Array(items) => items.iter().filter_map(candidate_from_entry).collect(),
-        Value::Object(map) => map
+fn collect_candidates(list: &CandidateList) -> Vec<Candidate> {
+    match list {
+        CandidateList::Entries(entries) => entries
+            .iter()
+            .filter_map(|entry| {
+                Some(Candidate {
+                    id: entry.id,
+                    token: entry.token.clone(),
+                    logprob: candidate_logprob(entry)?,
+                })
+            })
+            .collect(),
+        CandidateList::Map(map) => map
             .iter()
             .filter_map(|(key, value)| {
-                let logprob = as_logprob(value)?;
+                let logprob = map_logprob(value)?;
                 let id = key
                     .strip_prefix("token_id:")
                     .and_then(|text| text.parse::<u32>().ok());
@@ -209,28 +359,45 @@ fn collect_candidates(value: &Value) -> Vec<Candidate> {
                 })
             })
             .collect(),
-        _ => Vec::new(),
     }
 }
 
 /// Locate the candidate list for the first generated position.
-fn candidate_position<'a>(probe: Probe, body: &'a Value) -> Result<&'a Value> {
-    let first = |path: &str| -> Result<&'a Value> {
-        body.pointer(path)
-            .ok_or_else(|| anyhow!("response has no {path}"))
-    };
+///
+/// The order within each probe is deliberate: the shape that probe is expected
+/// to receive is tried first, and the alternative is only a fallback for
+/// runtimes that answer in the other dialect.
+fn candidate_position(
+    probe: Probe,
+    response: &CompletionResponse,
+) -> Result<&CandidateList> {
+    let choice = response.choices.first();
+    let logprobs = choice.and_then(|choice| choice.logprobs.as_ref());
     match probe {
         // llama.cpp answers `/v1/completions` with chat-shaped logprobs.
-        Probe::CompletionsTopK => first("/choices/0/logprobs/content/0/top_logprobs")
-            .or_else(|_| first("/choices/0/logprobs/top_logprobs/0")),
-        Probe::LogprobTokenIds | Probe::AllowedTokenIdsTopK => {
-            first("/choices/0/logprobs/top_logprobs/0")
-                .or_else(|_| first("/choices/0/logprobs/content/0/top_logprobs"))
-        }
-        // `top_probs` is only consulted when `top_logprobs` is absent, because
-        // a probability loses precision against a log probability.
-        Probe::LlamaCppNProbs => first("/completion_probabilities/0/top_logprobs")
-            .or_else(|_| first("/completion_probabilities/0/top_probs")),
+        Probe::CompletionsTopK => logprobs
+            .and_then(|logprobs| logprobs.content.first())
+            .and_then(|position| position.top_logprobs.as_ref())
+            .or_else(|| logprobs.and_then(|logprobs| logprobs.top_logprobs.first()))
+            .ok_or_else(|| anyhow!("response has no candidates under choices[0].logprobs")),
+        Probe::LogprobTokenIds | Probe::AllowedTokenIdsTopK => logprobs
+            .and_then(|logprobs| logprobs.top_logprobs.first())
+            .or_else(|| {
+                logprobs
+                    .and_then(|logprobs| logprobs.content.first())
+                    .and_then(|position| position.top_logprobs.as_ref())
+            })
+            .ok_or_else(|| anyhow!("response has no candidates under choices[0].logprobs")),
+        Probe::LlamaCppNProbs => response
+            .completion_probabilities
+            .first()
+            .and_then(|position| {
+                position
+                    .top_logprobs
+                    .as_ref()
+                    .or(position.top_probs.as_ref())
+            })
+            .ok_or_else(|| anyhow!("response has no candidates under completion_probabilities[0]")),
     }
 }
 
@@ -242,22 +409,31 @@ fn find_candidate(candidates: &[Candidate], slot: u32, letter: char) -> Option<f
         .map(|candidate| candidate.logprob)
 }
 
+/// Decode a scoring response into the struct the bridge reads.
+pub fn parse_response(body: &Value) -> Result<CompletionResponse> {
+    serde_json::from_value(body.clone())
+        .context("the scoring response did not match any known shape")
+}
+
 /// Extract one log probability per requested slot, in slot order.
 ///
 /// A missing slot is an error rather than a zero: silently dropping an option
 /// would change the meaning of the returned distribution.
 pub fn parse_logprobs(
     probe: Probe,
-    body: &Value,
+    response: &CompletionResponse,
     slots: &[u32],
     letters: &[char],
 ) -> Result<Vec<f64>> {
-    if let Some(finish) = body.pointer("/choices/0/finish_reason").and_then(Value::as_str)
+    if let Some(finish) = response
+        .choices
+        .first()
+        .and_then(|choice| choice.finish_reason.as_deref())
         && finish == "error"
     {
         bail!("service reported finish_reason=error");
     }
-    let candidates = collect_candidates(candidate_position(probe, body)?);
+    let candidates = collect_candidates(candidate_position(probe, response)?);
     if candidates.is_empty() {
         bail!("returned distribution contains no usable candidates");
     }
@@ -291,8 +467,31 @@ pub fn candidates_restricted_to(candidates: &[Candidate], slots: &[u32], letters
     })
 }
 
-pub fn parse_candidates(probe: Probe, body: &Value) -> Result<Vec<Candidate>> {
-    Ok(collect_candidates(candidate_position(probe, body)?))
+pub fn parse_candidates(probe: Probe, response: &CompletionResponse) -> Result<Vec<Candidate>> {
+    Ok(collect_candidates(candidate_position(probe, response)?))
+}
+
+/// The prompt length the runtime reported, or zero when it reported none.
+pub fn input_tokens(probe: Probe, response: &CompletionResponse) -> u64 {
+    match probe {
+        Probe::LlamaCppNProbs => response.tokens_evaluated.unwrap_or(0),
+        _ => response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.prompt_tokens)
+            .unwrap_or(0),
+    }
+}
+
+/// Whether the runtime silently shortened the prompt.
+///
+/// A truncated prompt would score a decision the caller never asked for, so the
+/// bridge turns this into an error instead of a slightly wrong answer.
+pub fn truncated(probe: Probe, response: &CompletionResponse) -> bool {
+    match probe {
+        Probe::LlamaCppNProbs => response.truncated,
+        _ => false,
+    }
 }
 
 /// Validate that a probe response is usable before adopting its transport.
@@ -312,13 +511,18 @@ pub fn validate_probe(logprobs: &[f64]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn logprob_token_ids_body_restricts_and_selects() {
-        let body = build_body(Probe::LogprobTokenIds, "m", "prompt", &[32, 33]);
-        assert_eq!(body["allowed_token_ids"], json!([32, 33]));
-        assert_eq!(body["logprob_token_ids"], json!([32, 33]));
-        assert_eq!(body["max_tokens"], 1);
+        let RequestBody::OpenAi(body) = build_body(Probe::LogprobTokenIds, "m", "prompt", &[32, 33])
+        else {
+            panic!("this probe speaks the OpenAI dialect");
+        };
+        assert_eq!(body.allowed_token_ids.as_deref(), Some(&[32u32, 33][..]));
+        assert_eq!(body.logprob_token_ids.as_deref(), Some(&[32u32, 33][..]));
+        assert_eq!(body.max_tokens, 1);
+        assert_eq!(body.logprobs, 1, "only the requested ids need reporting");
     }
 
     #[test]
@@ -332,12 +536,26 @@ mod tests {
 
     #[test]
     fn llamacpp_body_neutralizes_the_sampler() {
-        let body = build_body(Probe::LlamaCppNProbs, "m", "prompt", &[54, 55]);
-        assert_eq!(body["n_predict"], 1);
-        assert_eq!(body["n_probs"], 32);
-        assert_eq!(body["temperature"], 1.0);
-        assert_eq!(body["top_k"], 0);
-        assert_eq!(body["repeat_penalty"], 1.0);
+        let RequestBody::LlamaCpp(body) = build_body(Probe::LlamaCppNProbs, "m", "prompt", &[54, 55])
+        else {
+            panic!("this probe speaks the llama.cpp dialect");
+        };
+        assert_eq!(body.n_predict, 1);
+        assert_eq!(body.n_probs, 32);
+        assert_eq!(body.temperature, 1.0);
+        assert_eq!(body.top_k, 0, "top-k truncation would hide low-ranked options");
+        assert_eq!(body.repeat_penalty, 1.0, "a penalty would distort the distribution");
+    }
+
+    #[test]
+    fn an_unrestricted_probe_omits_the_vllm_only_fields() {
+        let RequestBody::OpenAi(body) = build_body(Probe::CompletionsTopK, "m", "prompt", &[54, 55])
+        else {
+            panic!("this probe speaks the OpenAI dialect");
+        };
+        assert!(body.allowed_token_ids.is_none());
+        assert!(body.logprob_token_ids.is_none());
+        assert_eq!(body.logprobs, 32);
     }
 
     #[test]
@@ -345,14 +563,14 @@ mod tests {
         let body = json!({"choices": [{"logprobs": {"top_logprobs": [{
             "token_id:32": -0.51, "token_id:33": -1.2, "token_id:99": -4.0
         }]}}]});
-        let values = parse_logprobs(Probe::LogprobTokenIds, &body, &[32, 33], &['A', 'B']).unwrap();
+        let values = parse_logprobs(Probe::LogprobTokenIds, &parse_response(&body).unwrap(), &[32, 33], &['A', 'B']).unwrap();
         assert_eq!(values, vec![-0.51, -1.2]);
     }
 
     #[test]
     fn vllm_map_response_falls_back_to_token_text() {
         let body = json!({"choices": [{"logprobs": {"top_logprobs": [{"A": -0.1, "B": -2.0}]}}]});
-        let values = parse_logprobs(Probe::CompletionsTopK, &body, &[32, 33], &['A', 'B']).unwrap();
+        let values = parse_logprobs(Probe::CompletionsTopK, &parse_response(&body).unwrap(), &[32, 33], &['A', 'B']).unwrap();
         assert_eq!(values, vec![-0.1, -2.0]);
     }
 
@@ -368,7 +586,7 @@ mod tests {
                 {"id": 56, "token": "C", "logprob": -15.61}
             ]}]}}]});
         let values =
-            parse_logprobs(Probe::CompletionsTopK, &body, &[54, 55, 56], &['A', 'B', 'C']).unwrap();
+            parse_logprobs(Probe::CompletionsTopK, &parse_response(&body).unwrap(), &[54, 55, 56], &['A', 'B', 'C']).unwrap();
         assert_eq!(values, vec![-12.32, -2.1e-05, -15.61]);
     }
 
@@ -378,7 +596,7 @@ mod tests {
             "top_probs": [{"id": 32, "token": "A", "prob": 0.6}],
             "top_logprobs": [{"id": 32, "token": "A", "logprob": -0.51},
                              {"id": 33, "token": "B", "logprob": -0.92}]}]});
-        let values = parse_logprobs(Probe::LlamaCppNProbs, &body, &[32, 33], &['A', 'B']).unwrap();
+        let values = parse_logprobs(Probe::LlamaCppNProbs, &parse_response(&body).unwrap(), &[32, 33], &['A', 'B']).unwrap();
         assert_eq!(values, vec![-0.51, -0.92]);
     }
 
@@ -386,7 +604,7 @@ mod tests {
     fn llamacpp_native_response_falls_back_to_probabilities() {
         let body = json!({"completion_probabilities": [{"id": 32, "token": "A",
             "top_probs": [{"id": 32, "token": "A", "prob": 0.5}, {"id": 33, "token": "B", "prob": 0.5}]}]});
-        let values = parse_logprobs(Probe::LlamaCppNProbs, &body, &[32, 33], &['A', 'B']).unwrap();
+        let values = parse_logprobs(Probe::LlamaCppNProbs, &parse_response(&body).unwrap(), &[32, 33], &['A', 'B']).unwrap();
         assert!((values[0] - 0.5f64.ln()).abs() < 1e-12);
     }
 
@@ -394,7 +612,7 @@ mod tests {
     fn missing_option_is_an_error_not_a_zero() {
         let body = json!({"choices": [{"logprobs": {"top_logprobs": [{"token_id:32": -0.1}]}}]});
         let error =
-            parse_logprobs(Probe::CompletionsTopK, &body, &[32, 33], &['A', 'B']).unwrap_err();
+            parse_logprobs(Probe::CompletionsTopK, &parse_response(&body).unwrap(), &[32, 33], &['A', 'B']).unwrap_err();
         assert!(error.to_string().contains("absent from the returned distribution"));
     }
 

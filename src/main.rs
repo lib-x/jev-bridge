@@ -14,8 +14,11 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde_json::Value;
 
-use jev_bridge::prompt;
+use jev_bridge::prompt::{self, LocalComponents};
+use jev_bridge::render::LocalRenderer;
 use jev_bridge::server::{router, AppState, Bridge, BridgeConfig};
+#[cfg(feature = "local-tokenizer")]
+use jev_bridge::tokenizer::LocalTokenizer;
 use jev_bridge::wire::Row;
 
 #[derive(Parser, Debug)]
@@ -59,6 +62,20 @@ struct Args {
     /// JSON object forwarded as chat_template_kwargs when rendering the template
     #[arg(long, default_value = "{\"enable_thinking\": false}")]
     chat_template_kwargs: String,
+
+    /// Render the chat template locally from this Jinja file instead of asking
+    /// the runtime; needed for runtimes without /apply-template, such as vLLM
+    #[arg(long)]
+    chat_template_file: Option<PathBuf>,
+
+    /// JSON object added to every local render, for example {"bos_token": "<s>"}
+    #[arg(long, default_value = "{}")]
+    chat_template_context: String,
+
+    /// Tokenize with this local tokenizer.json instead of the runtime's
+    /// /tokenize endpoint; must be the model's own vocabulary
+    #[arg(long)]
+    tokenizer_json: Option<PathBuf>,
 
     /// Reject rows whose upstream prompt exceeds this many tokens
     #[arg(long)]
@@ -193,6 +210,31 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_native_base(&args.base_url));
 
+    let local_renderer = match &args.chat_template_file {
+        None => None,
+        Some(path) => {
+            let source = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {} failed", path.display()))?;
+            let context: Value = serde_json::from_str(&args.chat_template_context)
+                .context("--chat-template-context must be a JSON object")?;
+            let context = context
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("--chat-template-context must be a JSON object"))?;
+            Some(
+                LocalRenderer::new(source, context)
+                    .with_context(|| format!("compiling {} failed", path.display()))?,
+            )
+        }
+    };
+    let local_tokenizer = match &args.tokenizer_json {
+        None => None,
+        Some(path) => Some(
+            LocalTokenizer::from_file(path)
+                .with_context(|| format!("loading {} failed", path.display()))?,
+        ),
+    };
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
@@ -208,6 +250,10 @@ async fn main() -> Result<()> {
         release_date: args.served_model_release_date.clone(),
         chat_template_kwargs,
         max_input_tokens: args.max_input_tokens,
+        local: LocalComponents {
+            renderer: local_renderer,
+            tokenizer: local_tokenizer,
+        },
     };
 
     eprintln!(
