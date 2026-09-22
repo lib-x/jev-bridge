@@ -1,9 +1,20 @@
+<div align="center">
+
 # jev-bridge
+
+**Turn any generic OpenAI-compatible inference service into a Jev-style decision scoring service.**
+
+A single 7 MB binary with no Python dependency.
+
+[![crates.io](https://img.shields.io/crates/v/jev-bridge.svg)](https://crates.io/crates/jev-bridge)
+[![docs.rs](https://docs.rs/jev-bridge/badge.svg)](https://docs.rs/jev-bridge)
+[![license](https://img.shields.io/crates/l/jev-bridge.svg)](https://github.com/lib-x/jev-bridge/blob/main/LICENSE)
+[![downloads](https://img.shields.io/crates/d/jev-bridge.svg)](https://crates.io/crates/jev-bridge)
+[![rust](https://img.shields.io/badge/rust-2024%20edition-blue.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 
 [English](https://github.com/lib-x/jev-bridge/blob/main/README.md) | [简体中文](https://github.com/lib-x/jev-bridge/blob/main/README.zh-CN.md)
 
-Turn any generic OpenAI-compatible inference service into a Jev-style decision
-scoring service, in a single 7 MB binary with no Python dependency.
+</div>
 
 ## What it does
 

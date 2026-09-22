@@ -1,8 +1,20 @@
+<div align="center">
+
 # jev-bridge
+
+**把任意通用的 OpenAI 兼容推理服务，变成 Jev 风格的决策打分服务。**
+
+单个 7 MB 二进制，不依赖 Python。
+
+[![crates.io](https://img.shields.io/crates/v/jev-bridge.svg)](https://crates.io/crates/jev-bridge)
+[![docs.rs](https://docs.rs/jev-bridge/badge.svg)](https://docs.rs/jev-bridge)
+[![license](https://img.shields.io/crates/l/jev-bridge.svg)](https://github.com/lib-x/jev-bridge/blob/main/LICENSE)
+[![downloads](https://img.shields.io/crates/d/jev-bridge.svg)](https://crates.io/crates/jev-bridge)
+[![rust](https://img.shields.io/badge/rust-2024%20edition-blue.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 
 [English](https://github.com/lib-x/jev-bridge/blob/main/README.md) | [简体中文](https://github.com/lib-x/jev-bridge/blob/main/README.zh-CN.md)
 
-把任意通用的 OpenAI 兼容推理服务，变成 Jev 风格的决策打分服务。单个 7 MB 二进制，不依赖 Python。
+</div>
 
 ## 它做什么
 
