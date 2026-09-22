@@ -21,14 +21,19 @@ use crate::wire::{to_python_json, RowOption};
 #[cfg(feature = "local-tokenizer")]
 use crate::tokenizer::LocalTokenizer;
 
+/// The uppercase answer letters, in option order.
 pub const LETTERS: &str = "ABCDEFGHIJKLMNOP";
+/// The system instruction the direct contract freezes.
 pub const DIRECT_SYSTEM: &str = "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase letter, with no explanation or reasoning.";
+/// The prompt contract version recorded with every result.
 pub const PROMPT_VERSION: &str = "direct-options-v1";
 
 /// One chat message, in the shape every chat template expects.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
+    /// Who speaks: `system` or `user`.
     pub role: &'static str,
+    /// The message text, already serialised by the caller.
     pub content: String,
 }
 
@@ -134,6 +139,7 @@ pub struct RuntimeClient {
 }
 
 impl RuntimeClient {
+    /// Point a client at the runtime's native base URL.
     pub fn new(
         client: reqwest::Client,
         base: impl Into<String>,
@@ -192,6 +198,7 @@ impl RuntimeClient {
         Ok(response.prompt)
     }
 
+    /// Tokenize without special tokens, matching fastjev's `encode_prompt`.
     pub async fn tokenize(&self, content: &str) -> Result<Vec<u32>> {
         let body = TokenizeRequest {
             model: &self.model,
@@ -202,6 +209,7 @@ impl RuntimeClient {
         Ok(response.tokens)
     }
 
+    /// Decode tokens for the answer-slot round-trip check.
     pub async fn detokenize(&self, tokens: &[u32]) -> Result<String> {
         let body = DetokenizeRequest {
             model: &self.model,
@@ -219,8 +227,10 @@ impl RuntimeClient {
 /// runtime's own endpoints.
 #[derive(Default)]
 pub struct LocalComponents {
+    /// Renders the template in-process instead of calling `/apply-template`.
     pub renderer: Option<LocalRenderer>,
     #[cfg(feature = "local-tokenizer")]
+    /// Tokenizes in-process instead of calling `/tokenize`.
     pub tokenizer: Option<LocalTokenizer>,
 }
 
@@ -232,6 +242,7 @@ pub struct ChatTemplate {
 }
 
 impl ChatTemplate {
+    /// Combine a runtime with whichever in-process halves are configured.
     pub fn new(runtime: RuntimeClient, local: LocalComponents, chat_template_kwargs: Value) -> Self {
         Self {
             runtime,
@@ -257,6 +268,7 @@ impl ChatTemplate {
         }
     }
 
+    /// Render the decision prompt for one set of messages.
     pub async fn render(&self, messages: &[ChatMessage]) -> Result<String> {
         match &self.local.renderer {
             Some(local) => local.render(messages, &self.chat_template_kwargs),
@@ -268,6 +280,7 @@ impl ChatTemplate {
         }
     }
 
+    /// Tokenize locally when configured, otherwise through the runtime.
     pub async fn tokenize(&self, content: &str) -> Result<Vec<u32>> {
         #[cfg(feature = "local-tokenizer")]
         if let Some(local) = &self.local.tokenizer {
@@ -276,6 +289,7 @@ impl ChatTemplate {
         self.runtime.tokenize(content).await
     }
 
+    /// Detokenize locally when configured, otherwise through the runtime.
     pub async fn detokenize(&self, tokens: &[u32]) -> Result<String> {
         #[cfg(feature = "local-tokenizer")]
         if let Some(local) = &self.local.tokenizer {
@@ -340,6 +354,7 @@ impl ChatTemplate {
         Ok(())
     }
 
+    /// The template variables forwarded on every render.
     pub fn chat_template_kwargs(&self) -> Value {
         self.chat_template_kwargs.clone()
     }

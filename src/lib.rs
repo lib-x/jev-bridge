@@ -1,6 +1,5 @@
 //! Bridge a generic OpenAI-compatible inference API into a Jev-style decision
 //! scoring service.
-//!
 //! Jev-style decisions are not a model format; they are a readout. This crate
 //! implements that readout on top of any runtime that can return next-token log
 //! probabilities:
@@ -27,6 +26,13 @@
 //! * [`wire`] validates System One requests and builds their responses.
 //!
 //! The `jev-bridge` binary is a thin CLI over [`server::Bridge`].
+//!
+//! # Documentation
+//!
+//! Every public item is documented, and the crate builds with
+//! `#![warn(missing_docs)]` so that stays true.
+
+#![warn(missing_docs)]
 
 pub mod prompt;
 pub mod render;

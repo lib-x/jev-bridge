@@ -1,6 +1,6 @@
 # jev-bridge
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](https://github.com/lib-x/jev-bridge/blob/main/README.md) | [简体中文](https://github.com/lib-x/jev-bridge/blob/main/README.zh-CN.md)
 
 把任意通用的 OpenAI 兼容推理服务，变成 Jev 风格的决策打分服务。单个 7 MB 二进制，不依赖 Python。
 
@@ -73,8 +73,8 @@ Jev 的能力不是权重里的东西，而是一层读法协议。这个桥接�
 
 行级证据：
 
-- [results/alignment-minicpm5-2b-authored144.json](results/alignment-minicpm5-2b-authored144.json)
-- [results/bridge-minicpm5-2b-q8-authored144.predictions.jsonl](results/bridge-minicpm5-2b-q8-authored144.predictions.jsonl)
+- [results/alignment-minicpm5-2b-authored144.json](https://github.com/lib-x/jev-bridge/blob/main/results/alignment-minicpm5-2b-authored144.json)
+- [results/bridge-minicpm5-2b-q8-authored144.predictions.jsonl](https://github.com/lib-x/jev-bridge/blob/main/results/bridge-minicpm5-2b-q8-authored144.predictions.jsonl)
 
 ## 快速开始
 

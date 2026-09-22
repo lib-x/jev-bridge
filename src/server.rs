@@ -42,15 +42,25 @@ pub struct Bridge {
     lock: Mutex<()>,
 }
 
+/// Everything [`Bridge::connect`] needs to reach one upstream model.
 pub struct BridgeConfig {
+    /// OpenAI-compatible root, for example `http://127.0.0.1:8080/v1`.
     pub openai_base: String,
+    /// Native root for llama.cpp's `/completion`.
     pub native_base: String,
+    /// Model name sent upstream.
     pub upstream_model: String,
+    /// Bearer token for the upstream service, when it needs one.
     pub upstream_key: Option<String>,
+    /// Model id this bridge accepts from clients.
     pub served_model: String,
+    /// Description returned by `GET /v1/models`.
     pub description: String,
+    /// ISO release date returned by `GET /v1/models`.
     pub release_date: String,
+    /// Template variables, for example `{"enable_thinking": false}`.
     pub chat_template_kwargs: Value,
+    /// Reject rows above this token count instead of truncating them.
     pub max_input_tokens: Option<usize>,
     /// Render the chat template and/or tokenize in-process instead of asking
     /// the runtime.
@@ -61,8 +71,11 @@ pub struct BridgeConfig {
 /// reference run row by row.
 #[derive(Debug, Clone)]
 pub struct DetailedScore {
+    /// The normalized answer handed to the wire layer.
     pub answer: ScoredAnswer,
+    /// Raw option log probabilities, before the softmax.
     pub option_logprobs: Vec<f64>,
+    /// SHA-256 of the rendered prompt, for comparing runs row by row.
     pub prompt_sha256: String,
 }
 
@@ -150,18 +163,22 @@ impl Bridge {
         })
     }
 
+    /// The transport negotiated at startup.
     pub fn probe(&self) -> Probe {
         self.probe
     }
 
+    /// Resolved token id for each of the sixteen answer letters.
     pub fn slots(&self) -> &[u32] {
         &self.slots
     }
 
+    /// The model name this bridge sends upstream.
     pub fn upstream_model(&self) -> &str {
         &self.upstream_model
     }
 
+    /// Template variables forwarded on every render.
     pub fn chat_template_kwargs(&self) -> Value {
         self.template.chat_template_kwargs()
     }
@@ -302,10 +319,13 @@ pub async fn post_json<T: serde::de::DeserializeOwned>(
 
 /// Shared HTTP state.
 pub struct AppState {
+    /// The configured bridge, shared by every handler.
     pub bridge: Bridge,
+    /// When set, clients must present this bearer token.
     pub api_key: Option<String>,
 }
 
+/// The HTTP surface: `/v1/systemone`, `/v1/models` and `/health`.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/systemone", post(systemone))

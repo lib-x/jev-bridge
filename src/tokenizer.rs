@@ -21,6 +21,7 @@ pub struct LocalTokenizer {
 }
 
 impl LocalTokenizer {
+    /// Load a `tokenizer.json` from disk.
     pub fn from_file(path: &Path) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(path).map_err(|error| {
             anyhow::anyhow!("loading {} failed: {error}", path.display())
@@ -28,6 +29,7 @@ impl LocalTokenizer {
         Ok(Self { tokenizer })
     }
 
+    /// Load a `tokenizer.json` already in memory.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let tokenizer = Tokenizer::from_bytes(bytes)
             .map_err(|error| anyhow::anyhow!("parsing the tokenizer failed: {error}"))?;

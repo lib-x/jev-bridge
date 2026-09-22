@@ -8,6 +8,11 @@ repository = "https://github.com/lib-x/jev-bridge"
 readme = "README.md"
 keywords = ["llm", "llama-cpp", "logprobs", "classification", "inference"]
 categories = ["web-programming::http-server", "science"]
+# The alignment evidence stays in the repository; the README links to it there.
+exclude = ["results/"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 anyhow = "1"

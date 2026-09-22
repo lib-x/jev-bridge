@@ -1,6 +1,6 @@
 # jev-bridge
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](https://github.com/lib-x/jev-bridge/blob/main/README.md) | [简体中文](https://github.com/lib-x/jev-bridge/blob/main/README.zh-CN.md)
 
 Turn any generic OpenAI-compatible inference service into a Jev-style decision
 scoring service, in a single 7 MB binary with no Python dependency.
@@ -83,8 +83,8 @@ Per family, `candidate_selection` and `rule_application` are identical and only
 
 Row-level evidence:
 
-- [results/alignment-minicpm5-2b-authored144.json](results/alignment-minicpm5-2b-authored144.json)
-- [results/bridge-minicpm5-2b-q8-authored144.predictions.jsonl](results/bridge-minicpm5-2b-q8-authored144.predictions.jsonl)
+- [results/alignment-minicpm5-2b-authored144.json](https://github.com/lib-x/jev-bridge/blob/main/results/alignment-minicpm5-2b-authored144.json)
+- [results/bridge-minicpm5-2b-q8-authored144.predictions.jsonl](https://github.com/lib-x/jev-bridge/blob/main/results/bridge-minicpm5-2b-q8-authored144.predictions.jsonl)
 
 ## Quick start
 

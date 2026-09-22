@@ -33,6 +33,7 @@ pub enum Probe {
     LlamaCppNProbs,
 }
 
+/// The transports to try, in the order they are probed.
 pub const CANDIDATES: [Probe; 4] = [
     Probe::LogprobTokenIds,
     Probe::AllowedTokenIdsTopK,
@@ -41,6 +42,7 @@ pub const CANDIDATES: [Probe; 4] = [
 ];
 
 impl Probe {
+    /// Stable identifier reported by `GET /health`.
     pub fn name(self) -> &'static str {
         match self {
             Probe::LogprobTokenIds => "vllm-logprob-token-ids",
@@ -50,6 +52,7 @@ impl Probe {
         }
     }
 
+    /// One line describing what this transport relies on.
     pub fn note(self) -> &'static str {
         match self {
             Probe::LogprobTokenIds => {
@@ -74,6 +77,7 @@ impl Probe {
         matches!(self, Probe::LogprobTokenIds | Probe::AllowedTokenIdsTopK)
     }
 
+    /// The path this transport posts to.
     pub fn endpoint(self) -> &'static str {
         match self {
             Probe::LlamaCppNProbs => "/completion",
@@ -162,10 +166,13 @@ pub struct LlamaCppCompletionRequest {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum RequestBody {
+    /// `/v1/completions` in the OpenAI dialect.
     OpenAi(OpenAiCompletionRequest),
+    /// llama.cpp's native `/completion`.
     LlamaCpp(LlamaCppCompletionRequest),
 }
 
+/// Build the scoring request for one probe.
 pub fn build_body(probe: Probe, model: &str, prompt: &str, slots: &[u32]) -> RequestBody {
     let candidates = top_k(probe, slots.len());
     match probe {
@@ -217,6 +224,7 @@ pub fn build_body(probe: Probe, model: &str, prompt: &str, slots: &[u32]) -> Req
     }
 }
 
+/// The full URL a probe posts to.
 pub fn request_url(probe: Probe, openai_base: &str, native_base: &str) -> String {
     probe.url(openai_base, native_base)
 }
@@ -224,8 +232,11 @@ pub fn request_url(probe: Probe, openai_base: &str, native_base: &str) -> String
 /// One candidate token in a returned distribution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
+    /// Token id, when the runtime reported one.
     pub id: Option<u32>,
+    /// Token text, or `token_id:<n>` in the OpenAI map shape.
     pub token: String,
+    /// Natural-log probability.
     pub logprob: f64,
 }
 
@@ -467,6 +478,7 @@ pub fn candidates_restricted_to(candidates: &[Candidate], slots: &[u32], letters
     })
 }
 
+/// Decode the returned candidates without requiring any slot to be present.
 pub fn parse_candidates(probe: Probe, response: &CompletionResponse) -> Result<Vec<Candidate>> {
     Ok(collect_candidates(candidate_position(probe, response)?))
 }

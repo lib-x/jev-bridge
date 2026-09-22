@@ -10,9 +10,21 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::io;
 
+/// The largest number of options a `choice` question may offer.
+///
+/// Sixteen matches the sixteen uppercase letters the readout can address.
 pub const MAX_OPTIONS: usize = 16;
+
+/// The largest number of levels a `score` question may offer.
 pub const MAX_SCORE_LEVELS: usize = 10;
+
+/// How the bridge derives its certainty proxy.
+///
+/// This is `1 - normalized entropy`, documented as such because TypeSafe does
+/// not publish the statistic behind its own `confidence` field.
 pub const CONFIDENCE_METHOD: &str = "one-minus-normalized-entropy";
+
+/// The disclaimer attached to every returned probability.
 pub const PROBABILITY_STATUS: &str = "conditional option scores; uncalibrated as decision confidence";
 
 /// A request that cannot be represented by the scoring backend.
@@ -80,10 +92,14 @@ impl serde_json::ser::Formatter for PythonFormatter {
     }
 }
 
+/// The three question shapes the System One API defines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    /// Pick one of several described options.
     Choice,
+    /// Answer a yes/no proposition; maps to the two options `true` and `false`.
     Noul,
+    /// Pick one of several ordered levels; the answer is a weighted value.
     Score,
 }
 
@@ -98,25 +114,38 @@ impl Kind {
     }
 }
 
+/// What a validated question asks for, kept for building the response.
 #[derive(Debug, Clone)]
 pub struct QuestionSpec {
+    /// The caller's question id, echoed back as the answer key.
     pub id: String,
+    /// Which of the three shapes this question is.
     pub kind: Kind,
+    /// Option ids in the order they were declared, which fixes the answer order.
     pub option_ids: Vec<String>,
+    /// Level texts for a `score` question, empty otherwise.
     pub legend: Vec<String>,
 }
 
+/// One answer option handed to the scorer.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RowOption {
+    /// Stable option id returned as the winning value.
     pub id: String,
+    /// The text the model actually reads, after any id prefix was added.
     pub description: String,
 }
 
+/// One decision, in the shape the scorer and the `--score` fixture both use.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Row {
+    /// Row id, echoed into the prediction.
     pub id: String,
+    /// Arbitrary JSON evidence: a string, an object or an array.
     pub state: Value,
+    /// The criterion to apply to the state.
     pub question: String,
+    /// Between 2 and [`MAX_OPTIONS`] options.
     pub options: Vec<RowOption>,
 }
 
@@ -335,10 +364,15 @@ fn score_options(question: &Map<String, Value>, base: &str) -> Result<Options> {
 /// A scorer result reduced to what the wire layer needs.
 #[derive(Debug, Clone)]
 pub struct ScoredAnswer {
+    /// Row id, copied from the request.
     pub id: String,
+    /// Option ids in the order the probabilities follow.
     pub option_ids: Vec<String>,
+    /// One probability per option id, summing to one.
     pub probabilities: Vec<f64>,
+    /// Prompt length the runtime reported.
     pub input_tokens: u64,
+    /// Prompt contract version, when the backend recorded one.
     pub prompt_version: Option<String>,
 }
 
@@ -394,18 +428,22 @@ fn normalized_probabilities(spec: &QuestionSpec, result: &ScoredAnswer) -> Resul
 pub struct OrderedMap<V>(Vec<(String, V)>);
 
 impl<V> OrderedMap<V> {
+    /// An empty map.
     pub fn new() -> Self {
         Self(Vec::new())
     }
 
+    /// Append a key, keeping insertion order.
     pub fn insert(&mut self, key: String, value: V) {
         self.0.push((key, value));
     }
 
+    /// Whether no entry has been inserted.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// How many entries were inserted.
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -437,24 +475,37 @@ impl<V: Serialize> Serialize for OrderedMap<V> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Answer {
+    /// Answer a yes/no question.
     Noul {
+        /// Probability assigned to `true`.
         noul: f64,
     },
+    /// Pick one of several described options.
     Choice {
+        /// The winning option id.
         choice: String,
+        /// Full distribution over the declared options.
         probabilities: OrderedMap<f64>,
+        /// Certainty proxy; see [`CONFIDENCE_METHOD`].
         confidence: f64,
     },
+    /// Pick one of several ordered levels.
     Score {
+        /// Probability-weighted level value.
         score: f64,
+        /// Level index to level text, in declared order.
         legend: OrderedMap<String>,
+        /// Full distribution over the declared levels.
         probabilities: OrderedMap<f64>,
+        /// Certainty proxy; see [`CONFIDENCE_METHOD`].
         confidence: f64,
     },
 }
 
 #[derive(Debug, Serialize)]
+/// Token accounting for one request.
 pub struct Usage {
+    /// Sum of the per-question prompt lengths.
     pub input_tokens: u64,
     /// Always zero: the bridge reads log probabilities instead of generating.
     pub output_tokens: u64,
@@ -463,17 +514,24 @@ pub struct Usage {
 /// The bridge's own extension block, mirroring fastjev's System One adapter.
 #[derive(Debug, Serialize)]
 pub struct FastjevMeta {
+    /// The uncalibrated-probability disclaimer.
     pub probability_status: &'static str,
+    /// How `confidence` was derived.
     pub confidence_method: &'static str,
+    /// Distinct prompt versions that produced this response.
     pub prompt_versions: Vec<String>,
 }
 
 /// The documented System One response shape.
 #[derive(Debug, Serialize)]
 pub struct SystemOneResponse {
+    /// The served model id, echoed from the request.
     pub model: String,
+    /// One answer per question id, in request order.
     pub answers: OrderedMap<Answer>,
+    /// Token accounting.
     pub usage: Usage,
+    /// Bridge-specific metadata.
     pub fastjev: FastjevMeta,
 }
 
