@@ -113,17 +113,20 @@ const INJECTED_SCRIPT: &str = r##"
   };
   ensurePanel();
 
-  const beginRequest = () => {
-    pendingStarted = performance.now();
+  // Each request carries its own start time: the games fire the next decision
+  // before the previous response body is parsed, so a shared clock would
+  // report the wrong latency.
+  const beginRequest = (started) => {
+    pendingStarted = started;
     clearInterval(pendingTimer);
     setStatus("pending", "requesting… 0.0 s");
     pendingTimer = setInterval(() => {
       setStatus("pending", "requesting… " + ((performance.now() - pendingStarted) / 1000).toFixed(1) + " s");
     }, 200);
   };
-  const finishRequest = (ok, status, payload) => {
+  const finishRequest = (started, ok, status, payload) => {
     clearInterval(pendingTimer);
-    const latencyMs = Math.round(performance.now() - pendingStarted);
+    const latencyMs = Math.round(performance.now() - started);
     const answers = payload && payload.answers ? Object.keys(payload.answers).length : 0;
     setStatus(
       ok ? "ok" : "error",
@@ -149,18 +152,19 @@ const INJECTED_SCRIPT: &str = r##"
         // Not our request shape; pass it through untouched.
       }
     }
-    if (isDecision) beginRequest();
+    const started = performance.now();
+    if (isDecision) beginRequest(started);
     return originalFetch(url, init).then(
       (response) => {
         if (isDecision) {
           response.clone().json()
-            .then((payload) => finishRequest(response.ok, response.status, payload))
-            .catch(() => finishRequest(response.ok, response.status, { error: "response body was not JSON" }));
+            .then((payload) => finishRequest(started, response.ok, response.status, payload))
+            .catch(() => finishRequest(started, response.ok, response.status, { error: "response body was not JSON" }));
         }
         return response;
       },
       (error) => {
-        if (isDecision) finishRequest(false, 0, { error: String(error) });
+        if (isDecision) finishRequest(started, false, 0, { error: String(error) });
         throw error;
       }
     );
@@ -187,14 +191,19 @@ const INJECTED_SCRIPT: &str = r##"
     }
     return false;
   };
-  const rebrand = () => {
-    document.title = rebrandText(document.title);
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+  // The games re-render their headings as they run, so a one-shot pass would be
+  // undone; a subtree rewrite keeps every later render rebranded.
+  const rebrandWithin = (root) => {
+    if (root.nodeType === Node.TEXT_NODE) {
+      if (!insidePanel(root) && /djev/i.test(root.nodeValue || "")) {
+        root.nodeValue = rebrandText(root.nodeValue);
+      }
+      return;
+    }
+    if (root.nodeType !== Node.ELEMENT_NODE || /^(SCRIPT|STYLE)$/.test(root.nodeName)) return;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode: (node) =>
-        node.parentNode &&
-        (/^(SCRIPT|STYLE)$/.test(node.parentNode.nodeName) || insidePanel(node))
-          ? NodeFilter.FILTER_REJECT
-          : NodeFilter.FILTER_ACCEPT,
+        insidePanel(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
     });
     const nodes = [];
     while (walker.nextNode()) nodes.push(walker.currentNode);
@@ -204,9 +213,18 @@ const INJECTED_SCRIPT: &str = r##"
       }
     }
   };
+  const rebrand = () => {
+    document.title = rebrandText(document.title);
+    rebrandWithin(document.body);
+  };
   rebrand();
-  // Some titles are built after load; give them a second pass.
-  setTimeout(rebrand, 600);
+  new MutationObserver((mutations) => {
+    document.title = rebrandText(document.title);
+    for (const mutation of mutations) {
+      if (mutation.type === "characterData") rebrandWithin(mutation.target);
+      for (const node of mutation.addedNodes) rebrandWithin(node);
+    }
+  }).observe(document.body, { childList: true, subtree: true, characterData: true });
 })();
 </script>
 "##;
