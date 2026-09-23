@@ -244,7 +244,7 @@ readout 通道（每个答案字母一个 token、读末位 log 概率）假设�
 
 ```toml
 [dependencies]
-jev-bridge = "0.2"
+jev-bridge = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"

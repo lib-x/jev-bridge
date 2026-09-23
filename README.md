@@ -280,7 +280,7 @@ reports the same declaration.
 
 ```toml
 [dependencies]
-jev-bridge = "0.2"
+jev-bridge = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
