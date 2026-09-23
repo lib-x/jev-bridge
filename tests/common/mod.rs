@@ -35,6 +35,11 @@ pub struct UpstreamConfig {
     pub tokenize: bool,
     /// How the mock answers a batched (array-`prompt`) request.
     pub batch: BatchBehaviour,
+    /// When nonzero, a request that asks for fewer than this many candidates
+    /// drops the last answer letter, the way an unrestricted distribution can
+    /// rank a letter below the requested top-k. A deepened retry then sees
+    /// every letter, which is how the bridge's retry ladder gets exercised.
+    pub deep_enough: usize,
 }
 
 /// How the mock answers a request that carries an array `prompt`.
@@ -62,6 +67,7 @@ impl Default for UpstreamConfig {
             foreign_tokens: true,
             tokenize: true,
             batch: BatchBehaviour::Supported,
+            deep_enough: 0,
         }
     }
 }
@@ -157,8 +163,15 @@ async fn detokenize() -> Json<Value> {
 /// distribution always carries ordinary vocabulary; without them the bridge's
 /// restriction check could not tell a restricted response from an unrestricted
 /// one.
-fn candidates(config: UpstreamConfig) -> Value {
-    let mut entries: Vec<Value> = (0..config.letters)
+fn candidates(config: UpstreamConfig, requested: usize) -> Value {
+    // A shallow request can miss the last letter, so a test can prove that a
+    // missing slot deepens the retry instead of failing the decision.
+    let letters = if config.deep_enough > 0 && requested < config.deep_enough {
+        config.letters.saturating_sub(1)
+    } else {
+        config.letters
+    };
+    let mut entries: Vec<Value> = (0..letters)
         .map(|index| {
             let letter = LETTERS.chars().nth(index).unwrap();
             json!({
@@ -191,6 +204,13 @@ async fn completions(
 
     state.completion_calls.fetch_add(1, Ordering::Relaxed);
     let config = state.config;
+    // How many candidates the caller asked for; a shallow request may miss an
+    // answer letter, which is what the retry ladder exists for.
+    let requested = body
+        .get("logprobs")
+        .or_else(|| body.get("n_probs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
 
     // A single prompt arrives as a string; a batched readout as an array.
     let prompts: Vec<String> = match body.get("prompt") {
@@ -250,7 +270,7 @@ async fn completions(
                     "id": slot_for('A'),
                     "token": "A",
                     "logprob": -1.0,
-                    "top_logprobs": candidates(config),
+                    "top_logprobs": candidates(config, requested),
                 }]},
             })
         })

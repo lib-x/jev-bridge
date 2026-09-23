@@ -107,15 +107,56 @@ impl Probe {
 ///
 /// A restricted distribution only ever contains the answer tokens, so k equal
 /// to the option count suffices. An unrestricted distribution also contains
-/// ordinary vocabulary, and measurement on a 2B llama.cpp model showed four of
-/// sixteen answer letters falling outside k=20, so unrestricted probes ask for
-/// a wide margin instead.
+/// ordinary vocabulary, and the letters compete with it:
+///
+/// * measured on a 2B llama.cpp model, four of sixteen answer letters fell
+///   outside k=20;
+/// * measured on a 9B model with a ~1000-token prompt and sixteen options (the
+///   djev-run tetris demo), `F` fell outside k=64.
+///
+/// So unrestricted transports ask for a wide margin — deeper is nearly free
+/// (the per-decision cost moved ~1% from k=100 to k=256 on the reference
+/// endpoint) while a missing slot is an error that [`candidate_ladder`] can
+/// retry away.
 fn top_k(probe: Probe, slot_count: usize) -> usize {
     match probe {
         Probe::LogprobTokenIds => 1,
         Probe::AllowedTokenIdsTopK => slot_count.max(4),
-        Probe::CompletionsTopK | Probe::LlamaCppNProbs => (slot_count * 4).clamp(32, 128),
+        Probe::CompletionsTopK | Probe::LlamaCppNProbs => (slot_count * 16).clamp(32, 256),
     }
+}
+
+/// The whole vocabulary, as an upper bound for a deepened request.
+///
+/// Any real tokenizer fits: the largest shipped vocabularies are around 260k
+/// entries, and llama.cpp caps `n_probs` at the vocabulary size.
+const FULL_VOCABULARY: usize = 200_000;
+
+/// The candidate counts to try for `slot_count` options, shallowest first.
+///
+/// The first request is sized by [`top_k`]; when it misses an answer token the
+/// caller retries with the next entry instead of failing the decision, because
+/// a large prompt can push a letter past a top-k that looked generous for the
+/// option count. Retries reuse the server's prefix cache, so only the readout
+/// is recomputed — measured on the reference endpoint, a deepened retry costs
+/// about one sampled token plus the larger candidate list.
+///
+/// Restricted transports never need more than one step (the server is told
+/// exactly which tokens to return); their ladder still deepens so the caller
+/// can treat every probe the same way.
+pub fn candidate_ladder(probe: Probe, slot_count: usize) -> Vec<usize> {
+    let initial = top_k(probe, slot_count);
+    let mut ladder = vec![initial];
+    for multiplier in [4, 16] {
+        let next = initial.saturating_mul(multiplier).min(FULL_VOCABULARY);
+        if next > *ladder.last().expect("the ladder starts nonempty") {
+            ladder.push(next);
+        }
+    }
+    if *ladder.last().expect("the ladder starts nonempty") < FULL_VOCABULARY {
+        ladder.push(FULL_VOCABULARY);
+    }
+    ladder
 }
 
 /// The `prompt` field of an OpenAI-compatible completions request.
@@ -203,7 +244,20 @@ pub enum RequestBody {
 /// native transport takes the first prompt and the caller falls back to
 /// sequential calls.
 pub fn build_body(probe: Probe, model: &str, prompts: &[String], slots: &[u32]) -> RequestBody {
-    let candidates = top_k(probe, slots.len());
+    build_body_with_candidates(probe, model, prompts, slots, top_k(probe, slots.len()))
+}
+
+/// Build the scoring request for one probe with an explicit candidate count.
+///
+/// A caller that retries after a missing option token passes a deeper count
+/// than [`top_k`] picks; see [`candidate_ladder`].
+pub fn build_body_with_candidates(
+    probe: Probe,
+    model: &str,
+    prompts: &[String],
+    slots: &[u32],
+    candidates: usize,
+) -> RequestBody {
     let prompt = match prompts {
         [one] => PromptField::Single(one.clone()),
         many => PromptField::Batch(many.to_vec()),
@@ -656,11 +710,29 @@ mod tests {
 
     #[test]
     fn unrestricted_probes_request_a_wide_top_k() {
-        assert_eq!(top_k(Probe::CompletionsTopK, 16), 64);
-        assert_eq!(top_k(Probe::LlamaCppNProbs, 16), 64);
+        assert_eq!(top_k(Probe::CompletionsTopK, 16), 256);
+        assert_eq!(top_k(Probe::LlamaCppNProbs, 16), 256);
         assert_eq!(top_k(Probe::CompletionsTopK, 2), 32);
         assert_eq!(top_k(Probe::AllowedTokenIdsTopK, 16), 16);
         assert_eq!(top_k(Probe::LogprobTokenIds, 16), 1);
+    }
+
+    #[test]
+    fn the_candidate_ladder_deepens_until_the_whole_vocabulary() {
+        assert_eq!(
+            candidate_ladder(Probe::CompletionsTopK, 16),
+            vec![256, 1024, 4096, FULL_VOCABULARY],
+            "sixteen options start at the top of the measured band and deepen from there"
+        );
+        assert_eq!(
+            candidate_ladder(Probe::LlamaCppNProbs, 2),
+            vec![32, 128, 512, FULL_VOCABULARY]
+        );
+        assert_eq!(
+            candidate_ladder(Probe::AllowedTokenIdsTopK, 16),
+            vec![16, 64, 256, FULL_VOCABULARY],
+            "restricted probes never retry, but their ladder is shaped the same way"
+        );
     }
 
     #[test]

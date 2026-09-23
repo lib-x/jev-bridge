@@ -30,7 +30,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -44,16 +44,23 @@ const PAGES: [&str; 3] = ["snake", "dino", "tetris"];
 
 /// A small script injected into every demo page.
 ///
-/// It lets the page be configured from the URL and auto-plays the game,
-/// without touching the upstream HTML (which ships no license):
+/// It shows the raw System One exchange, lets the page be configured from the
+/// URL, auto-plays the game and rebrands it — all without touching the
+/// upstream HTML (which ships no license):
 ///
+/// * a fixed panel reports the decision channel's state: `requesting…` with a
+///   running timer while a call is in flight, then `returned · HTTP 200 · …`
+///   (green) or `failed · …` (red), with the full response JSON below it;
 /// * `model=<id>` rewrites the `model` field of every `/v1/systemone` request,
 ///   so the demos' hard-coded `jev-latest` becomes whatever the bridge serves;
 /// * `api=<url>` re-points the request at another bridge (default: same origin,
 ///   i.e. this playground's proxy);
 /// * `auto=1` (the default) presses Start whenever the game is idle — on load
-///   and again after a game over.
-const INJECTED_SCRIPT: &str = r#"
+///   and again after a game over;
+/// * the upstream product titles (`djev / snake`, `djev (DiffusionGemma-Jev)`)
+///   are rewritten to `jev-bridge`, because that is what is actually serving
+///   the page. Attribution links (`mmastrac/djev-spark`) are left alone.
+const INJECTED_SCRIPT: &str = r##"
 <script>
 (() => {
   const params = new URLSearchParams(location.search);
@@ -61,34 +68,148 @@ const INJECTED_SCRIPT: &str = r#"
   const api = params.get("api") || "";
   const auto = params.get("auto") !== "0";
 
-  if (model || api) {
-    const originalFetch = window.fetch.bind(window);
-    window.fetch = (input, init) => {
-      let url = typeof input === "string" ? input : (input && input.url) || "";
-      if (url.endsWith("/v1/systemone") && init && typeof init.body === "string") {
-        try {
-          const body = JSON.parse(init.body);
-          if (model) body.model = model;
-          init = Object.assign({}, init, { body: JSON.stringify(body) });
-          if (api) url = api;
-        } catch (error) {
-          // Not our request shape; pass it through untouched.
-        }
+  // ---- the decision-channel panel: pending / returned / failed -------------
+  const PANEL = "jev-bridge-panel";
+  const COLORS = { idle: "#38bdf8", pending: "#facc15", ok: "#4ade80", error: "#f87171" };
+  let pendingTimer = null;
+  let pendingStarted = 0;
+
+  const ensurePanel = () => {
+    let panel = document.getElementById(PANEL);
+    if (panel) return panel;
+    panel = document.createElement("div");
+    panel.id = PANEL;
+    panel.style.cssText = [
+      "position:fixed", "left:0", "right:0", "bottom:0", "z-index:2147483647",
+      "background:rgba(15,23,42,.96)", "color:#e2e8f0",
+      "font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace",
+      "border-top:2px solid " + COLORS.idle, "box-shadow:0 -4px 16px rgba(0,0,0,.35)",
+    ].join(";");
+    panel.innerHTML =
+      '<div style="display:flex;gap:10px;align-items:center;padding:6px 12px;border-bottom:1px solid #1e293b">' +
+        '<b style="color:#38bdf8">jev-bridge</b>' +
+        '<span>POST /v1/systemone</span>' +
+        '<span id="' + PANEL + '-meta" style="color:#94a3b8">waiting for the first request…</span>' +
+        '<span style="flex:1"></span>' +
+        '<button id="' + PANEL + '-toggle" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:2px 8px;cursor:pointer">collapse</button>' +
+      '</div>' +
+      '<pre id="' + PANEL + '-body" style="margin:0;padding:8px 12px;max-height:32vh;overflow:auto;white-space:pre-wrap">The raw System One response appears here; the status line above shows whether a call is in flight.</pre>';
+    document.body.appendChild(panel);
+    const body = panel.querySelector("#" + PANEL + "-body");
+    panel.querySelector("#" + PANEL + "-toggle").addEventListener("click", (event) => {
+      const hidden = body.style.display === "none";
+      body.style.display = hidden ? "" : "none";
+      event.target.textContent = hidden ? "collapse" : "expand";
+    });
+    return panel;
+  };
+  const setStatus = (kind, text) => {
+    const panel = ensurePanel();
+    panel.style.borderTopColor = COLORS[kind] || COLORS.idle;
+    panel.querySelector("#" + PANEL + "-meta").textContent = text;
+  };
+  const setBody = (text) => {
+    ensurePanel().querySelector("#" + PANEL + "-body").textContent = text;
+  };
+  ensurePanel();
+
+  const beginRequest = () => {
+    pendingStarted = performance.now();
+    clearInterval(pendingTimer);
+    setStatus("pending", "requesting… 0.0 s");
+    pendingTimer = setInterval(() => {
+      setStatus("pending", "requesting… " + ((performance.now() - pendingStarted) / 1000).toFixed(1) + " s");
+    }, 200);
+  };
+  const finishRequest = (ok, status, payload) => {
+    clearInterval(pendingTimer);
+    const latencyMs = Math.round(performance.now() - pendingStarted);
+    const answers = payload && payload.answers ? Object.keys(payload.answers).length : 0;
+    setStatus(
+      ok ? "ok" : "error",
+      (ok ? "returned · " : "failed · ") + "HTTP " + status + " · " + latencyMs + " ms" +
+        (answers ? " · " + answers + " answer(s)" : "") +
+        (payload && payload.model ? " · " + payload.model : "")
+    );
+    setBody(JSON.stringify(payload, null, 2));
+  };
+
+  // ---- request rewriting + status capture ---------------------------------
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    let url = typeof input === "string" ? input : (input && input.url) || "";
+    const isDecision = url.endsWith("/v1/systemone");
+    if (isDecision && init && typeof init.body === "string" && (model || api)) {
+      try {
+        const payload = JSON.parse(init.body);
+        if (model) payload.model = model;
+        init = Object.assign({}, init, { body: JSON.stringify(payload) });
+        if (api) url = api;
+      } catch (error) {
+        // Not our request shape; pass it through untouched.
       }
-      return originalFetch(url, init);
-    };
-  }
+    }
+    if (isDecision) beginRequest();
+    return originalFetch(url, init).then(
+      (response) => {
+        if (isDecision) {
+          response.clone().json()
+            .then((payload) => finishRequest(response.ok, response.status, payload))
+            .catch(() => finishRequest(response.ok, response.status, { error: "response body was not JSON" }));
+        }
+        return response;
+      },
+      (error) => {
+        if (isDecision) finishRequest(false, 0, { error: String(error) });
+        throw error;
+      }
+    );
+  };
 
   if (auto) {
     setInterval(() => {
       const start = [...document.querySelectorAll("button")]
-        .find((button) => /^\s*start\s*$/i.test(button.textContent || ""));
+        .find((button) => /start/i.test(button.textContent || ""));
       if (start) start.click();
     }, 1500);
   }
+
+  // ---- rebrand ------------------------------------------------------------
+  const rebrandText = (text) =>
+    text
+      .replace(/djev\s*\(DiffusionGemma-Jev\)/gi, "jev-bridge")
+      .replace(/\bdjev\s*\/\s*(?=[A-Za-z])/g, "jev-bridge / ");
+  const insidePanel = (node) => {
+    let element = node.parentNode;
+    while (element) {
+      if (element.id === PANEL) return true;
+      element = element.parentNode;
+    }
+    return false;
+  };
+  const rebrand = () => {
+    document.title = rebrandText(document.title);
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+      acceptNode: (node) =>
+        node.parentNode &&
+        (/^(SCRIPT|STYLE)$/.test(node.parentNode.nodeName) || insidePanel(node))
+          ? NodeFilter.FILTER_REJECT
+          : NodeFilter.FILTER_ACCEPT,
+    });
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    for (const node of nodes) {
+      if (/djev/i.test(node.nodeValue || "")) {
+        node.nodeValue = rebrandText(node.nodeValue);
+      }
+    }
+  };
+  rebrand();
+  // Some titles are built after load; give them a second pass.
+  setTimeout(rebrand, 600);
 })();
 </script>
-"#;
+"##;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -113,6 +234,12 @@ struct Args {
     /// Port to bind
     #[arg(long, default_value_t = 8000)]
     port: u16,
+
+    /// Timeout for one proxied decision request, in seconds. The games' prompts
+    /// can be large (tetris sends a whole board plus sixteen placements), and a
+    /// slow upstream can take minutes; reqwest's 30 s default is far too short.
+    #[arg(long, default_value_t = 600)]
+    timeout_secs: u64,
 }
 
 #[derive(Clone)]
@@ -141,7 +268,10 @@ async fn main() -> Result<()> {
     let playground = Playground {
         demo_dir: args.demo_dir.clone(),
         bridge: bridge.clone(),
-        client: reqwest::Client::new(),
+        client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(args.timeout_secs))
+            .build()
+            .context("building the HTTP client failed")?,
     };
     let app = Router::new()
         .route("/", get(index))

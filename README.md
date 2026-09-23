@@ -467,8 +467,28 @@ git clone https://github.com/taeold/djev-run
 cargo run --example playground -- --demo-dir ./djev-run
 
 # browser
-open http://127.0.0.1:8000/snake
+open http://127.0.0.1:8000/
 ```
+
+The playground's index shows the bridge's `/health` and pre-fills the served
+model, and it injects a small script into every page (the upstream files are
+never modified) that:
+
+- **rebrands the product titles**: the pages say `djev / snake` and
+  `djev (DiffusionGemma-Jev)`, which are rewritten to `jev-bridge` in the
+  browser — that is what is actually serving them. Attribution links
+  (`mmastrac/djev-spark`, `trungdq88/jev-tetris`) are left alone.
+- **configures the API from the URL**: `?model=<id>` rewrites the `model` field
+  of every request (default: the served model, so `--accept-any-model` is not
+  needed), `?api=<url>` points the page at another bridge.
+- **auto-plays**: `?auto=1` (the default) presses the game's start button
+  whenever it is idle, on load and after a game over.
+
+Note `--timeout-secs` (default 600): the games' prompts vary a lot — snake
+sends about 200 tokens, tetris sends a whole board plus sixteen placements, and
+on a slow upstream that request can take minutes. reqwest's 30-second default
+would turn it into a 502 and the game would silently fall back to its built-in
+sandbox.
 
 ## Transport probing
 
@@ -487,10 +507,16 @@ tokens. If a server ignores those fields and returns foreign tokens, the
 transport is **rejected** rather than silently adopted — otherwise `/health`
 would report a contract the service is not actually honouring.
 
-Unrestricted distributions need a generous top-k: on a 2B quantized model,
-`k=20` missed four of the sixteen answer letters and `k=50` covered all of
-them. Unrestricted transports therefore request `4 × options` (floor 32, cap
-128). A missing option is always an error, never a zero.
+Unrestricted distributions need a generous top-k, and a request that misses an
+option is retried deeper instead of failing: on a 2B quantized model `k=20`
+missed four of the sixteen answer letters, and a 9B model under a ~1000-token
+prompt missed one at `k=64`. Unrestricted transports therefore start at
+`16 × options` (floor 32, cap 256) and walk a ladder — 4×, 16×, then the whole
+vocabulary — each step reusing the server's prefix cache, so a retry costs
+little more than the readout. Only when the deepest step still misses does the
+option become an error, and it is never a zero. The same ladder guards the
+transport probe, so a shallow first list cannot make a working transport look
+unsupported.
 
 ## Startup contracts
 

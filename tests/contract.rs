@@ -251,6 +251,31 @@ async fn a_multi_question_request_is_read_in_one_batch() {
 }
 
 #[tokio::test]
+async fn a_missing_slot_deepens_the_readout_instead_of_failing() {
+    // The mock hides the last answer letter until a request asks for 1024
+    // candidates: the first attempt (256 for sixteen options) misses it, the
+    // deepened retry sees it, and the decision is never turned into an error.
+    let (upstream, calls) = spawn_upstream_counting(UpstreamConfig {
+        deep_enough: 1024,
+        ..Default::default()
+    })
+    .await;
+    let bridge = RunningBridge::start(&upstream, None).await;
+    let baseline = calls.load(Ordering::Relaxed);
+    let payload = systemone_payload("The board is full.", sixteen_option_payload(), "bridge-mock");
+
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 200, "{body}");
+    // A shallow readout, then exactly one deepened retry.
+    assert_eq!(calls.load(Ordering::Relaxed) - baseline, 2);
+    // The letter the shallow attempt hid is scored, never dropped or zeroed.
+    assert!(
+        body["answers"]["route"]["probabilities"]["opt15"].is_number(),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn a_batch_rejected_by_shape_falls_back_to_sequential() {
     let (upstream, calls) = spawn_upstream_counting(UpstreamConfig {
         batch: BatchBehaviour::ShapeRejected,

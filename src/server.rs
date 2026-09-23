@@ -20,9 +20,9 @@ use crate::prompt::{
     LocalComponents, RuntimeClient, LETTERS, PROMPT_VERSION,
 };
 use crate::strategy::{
-    build_body, candidates_restricted_to, input_tokens, parse_batch_candidates, parse_candidates,
-    parse_logprobs, request_url, slot_logprobs_from_candidates, truncated, CompletionResponse,
-    Probe,
+    build_body_with_candidates, candidate_ladder, candidates_restricted_to, input_tokens,
+    parse_batch_candidates, parse_candidates, parse_logprobs, request_url,
+    slot_logprobs_from_candidates, truncated, CompletionResponse, Probe,
 };
 use crate::wire::{
     request_batch, response_from_results, OrderedMap, Question, ReadoutStatus, Row, ScoredAnswer,
@@ -402,6 +402,12 @@ impl Bridge {
     }
 
     /// One batched readout for every question, in request order.
+    ///
+    /// A missing option token deepens the request instead of failing it: the
+    /// first attempt sizes top-k from the option count, and a large prompt can
+    /// push an answer letter past it (measured: the tetris demo's sixteen
+    /// options missed `F` at k=64). A retry reuses the server's prefix cache,
+    /// so only the readout is recomputed.
     async fn read_batch(&self, questions: &[Question], prompts: &[String]) -> Result<Vec<Readout>> {
         // One `logprobs` value covers every prompt of the request, so it is
         // sized for the largest declared option set; each question then reads
@@ -412,48 +418,79 @@ impl Bridge {
             .max()
             .unwrap_or(0);
         let slots = &self.slots[..max_options];
-        let body = build_body(self.probe, &self.upstream_model, prompts, slots);
         let url = request_url(self.probe, &self.openai_base, &self.native_base);
-        let response: CompletionResponse =
-            post_json(&self.client, &url, &body, self.upstream_key.as_deref()).await?;
 
-        // The endpoint reports one usage block for the whole batch, and
-        // endpoints disagree on what it counts (llama.cpp b11096 counts the
-        // shared prefix once). It is attached to the first readout so summing
-        // the vector reproduces the endpoint's own number.
-        let batch_tokens = input_tokens(self.probe, &response);
-
-        // A batched prompt cannot be checked against `max_input_tokens` per
-        // prompt: the only number the endpoint gives is the batch total. The
-        // loose upper bound below still catches a request that is over budget
-        // even if every prompt shared one prefix.
-        if let Some(limit) = self.max_input_tokens
-            && batch_tokens > limit as u64 * questions.len() as u64
-        {
-            bail!(
-                "the batched readout reports {batch_tokens} input tokens, over {} x {limit}; \
-                 no truncation allowed",
-                questions.len()
+        let mut last_error = None;
+        for candidates_requested in candidate_ladder(self.probe, max_options) {
+            let body = build_body_with_candidates(
+                self.probe,
+                &self.upstream_model,
+                prompts,
+                slots,
+                candidates_requested,
             );
-        }
+            let response: CompletionResponse =
+                post_json(&self.client, &url, &body, self.upstream_key.as_deref()).await?;
 
-        let candidates = parse_batch_candidates(self.probe, &response, questions.len())?;
-        let mut readouts = Vec::with_capacity(questions.len());
-        for (index, (question, candidates)) in questions.iter().zip(&candidates).enumerate() {
-            let count = question.options.len();
-            let slots = &self.slots[..count];
-            let letters: Vec<char> = LETTERS.chars().take(count).collect();
-            let logprobs = slot_logprobs_from_candidates(candidates, slots, &letters)
-                .with_context(|| format!("question {:?}", question.id))?;
-            readouts.push(Readout {
-                logprobs,
-                input_tokens: if index == 0 { batch_tokens } else { 0 },
-            });
+            // The endpoint reports one usage block for the whole batch, and
+            // endpoints disagree on what it counts (llama.cpp b11096 counts the
+            // shared prefix once). It is attached to the first readout so summing
+            // the vector reproduces the endpoint's own number.
+            let batch_tokens = input_tokens(self.probe, &response);
+
+            // A batched prompt cannot be checked against `max_input_tokens` per
+            // prompt: the only number the endpoint gives is the batch total. The
+            // loose upper bound below still catches a request that is over budget
+            // even if every prompt shared one prefix.
+            if let Some(limit) = self.max_input_tokens
+                && batch_tokens > limit as u64 * questions.len() as u64
+            {
+                bail!(
+                    "the batched readout reports {batch_tokens} input tokens, over {} x {limit}; \
+                     no truncation allowed",
+                    questions.len()
+                );
+            }
+
+            let candidates = parse_batch_candidates(self.probe, &response, questions.len())?;
+            let mut readouts = Vec::with_capacity(questions.len());
+            let mut missing = None;
+            for (index, (question, candidates)) in questions.iter().zip(&candidates).enumerate() {
+                let count = question.options.len();
+                let slots = &self.slots[..count];
+                let letters: Vec<char> = LETTERS.chars().take(count).collect();
+                match slot_logprobs_from_candidates(candidates, slots, &letters) {
+                    Ok(logprobs) => readouts.push(Readout {
+                        logprobs,
+                        input_tokens: if index == 0 { batch_tokens } else { 0 },
+                    }),
+                    Err(error) => {
+                        missing = Some(error.context(format!("question {:?}", question.id)));
+                        break;
+                    }
+                }
+            }
+            match missing {
+                None => return Ok(readouts),
+                // A restricted distribution is already told which tokens to
+                // return; a missing one there is not fixed by asking deeper.
+                Some(error) if !self.probe.restricts_distribution() => {
+                    eprintln!(
+                        "{error:#}; deepening the batched readout past {candidates_requested} \
+                         candidates"
+                    );
+                    last_error = Some(error);
+                }
+                Some(error) => return Err(error),
+            }
         }
-        Ok(readouts)
+        Err(last_error.expect("a failed ladder records its last error"))
     }
 
     /// One readout per question, one upstream request each.
+    ///
+    /// A missing option token deepens the per-question request the same way
+    /// [`Self::read_batch`] does.
     async fn read_one_by_one(
         &self,
         questions: &[Question],
@@ -464,40 +501,63 @@ impl Bridge {
             let count = question.options.len();
             let slots = &self.slots[..count];
             let letters: Vec<char> = LETTERS.chars().take(count).collect();
-            let body = build_body(
-                self.probe,
-                &self.upstream_model,
-                std::slice::from_ref(prompt),
-                slots,
-            );
             let url = request_url(self.probe, &self.openai_base, &self.native_base);
-            let response: CompletionResponse =
-                post_json(&self.client, &url, &body, self.upstream_key.as_deref()).await?;
 
-            if truncated(self.probe, &response) {
-                bail!(
-                    "question {:?}: the upstream runtime truncated the prompt; shorten the state \
-                     or raise its context size",
-                    question.id
+            let mut last_error = None;
+            let mut readout = None;
+            for candidates_requested in candidate_ladder(self.probe, count) {
+                let body = build_body_with_candidates(
+                    self.probe,
+                    &self.upstream_model,
+                    std::slice::from_ref(prompt),
+                    slots,
+                    candidates_requested,
                 );
-            }
-            let tokens = input_tokens(self.probe, &response);
-            if let Some(limit) = self.max_input_tokens
-                && tokens > limit as u64
-            {
-                bail!(
-                    "question {:?}: {tokens} input tokens exceed limit {limit}; no truncation \
-                     allowed",
-                    question.id
-                );
-            }
+                let response: CompletionResponse =
+                    post_json(&self.client, &url, &body, self.upstream_key.as_deref()).await?;
 
-            let logprobs = parse_logprobs(self.probe, &response, slots, &letters)
-                .with_context(|| format!("question {:?}", question.id))?;
-            readouts.push(Readout {
-                logprobs,
-                input_tokens: tokens,
-            });
+                if truncated(self.probe, &response) {
+                    bail!(
+                        "question {:?}: the upstream runtime truncated the prompt; shorten the state \
+                         or raise its context size",
+                        question.id
+                    );
+                }
+                let tokens = input_tokens(self.probe, &response);
+                if let Some(limit) = self.max_input_tokens
+                    && tokens > limit as u64
+                {
+                    bail!(
+                        "question {:?}: {tokens} input tokens exceed limit {limit}; no truncation \
+                         allowed",
+                        question.id
+                    );
+                }
+
+                match parse_logprobs(self.probe, &response, slots, &letters) {
+                    Ok(logprobs) => {
+                        readout = Some(Readout {
+                            logprobs,
+                            input_tokens: tokens,
+                        });
+                        break;
+                    }
+                    Err(error) if !self.probe.restricts_distribution() => {
+                        eprintln!(
+                            "question {:?}: {error:#}; deepening the readout past \
+                             {candidates_requested} candidates",
+                            question.id
+                        );
+                        last_error = Some(error.context(format!("question {:?}", question.id)));
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("question {:?}", question.id));
+                    }
+                }
+            }
+            readouts.push(
+                readout.ok_or_else(|| last_error.expect("a failed ladder records its last error"))?,
+            );
         }
         Ok(readouts)
     }
@@ -511,21 +571,44 @@ async fn try_probe(
     slots: &[u32],
     letters: &[char],
 ) -> Result<()> {
-    let body = build_body(probe, &config.upstream_model, &[prompt.to_string()], slots);
     let url = request_url(probe, &config.openai_base, &config.native_base);
-    let response: CompletionResponse = post_json(client, &url, &body, config.upstream_key.as_deref()).await?;
-    let logprobs = parse_logprobs(probe, &response, slots, letters)?;
-    crate::strategy::validate_probe(&logprobs)?;
-    if probe.restricts_distribution() {
-        let candidates = parse_candidates(probe, &response)?;
-        if !candidates_restricted_to(&candidates, slots, letters) {
-            bail!(
-                "the server ignored the distribution restriction and returned foreign tokens, so \
-                 this transport would not be what it claims"
-            );
+    // A probe can miss an answer token for the same reason a readout can, so it
+    // walks the ladder too: a transport must not be declared unsupported just
+    // because its first candidate list was too shallow.
+    let mut last_error = None;
+    for candidates_requested in candidate_ladder(probe, slots.len()) {
+        let body = build_body_with_candidates(
+            probe,
+            &config.upstream_model,
+            &[prompt.to_string()],
+            slots,
+            candidates_requested,
+        );
+        let response: CompletionResponse =
+            post_json(client, &url, &body, config.upstream_key.as_deref()).await?;
+        match parse_logprobs(probe, &response, slots, letters) {
+            Ok(logprobs) => {
+                crate::strategy::validate_probe(&logprobs)?;
+                if probe.restricts_distribution() {
+                    let candidates = parse_candidates(probe, &response)?;
+                    if !candidates_restricted_to(&candidates, slots, letters) {
+                        bail!(
+                            "the server ignored the distribution restriction and returned foreign tokens, so \
+                             this transport would not be what it claims"
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            // Only an unrestricted distribution can be fixed by asking deeper;
+            // a restricted one that misses a slot is misreporting itself.
+            Err(error) if !probe.restricts_distribution() => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
         }
     }
-    Ok(())
+    Err(last_error.expect("a failed ladder records its last error"))
 }
 
 /// POST a typed request body and decode a typed response.
