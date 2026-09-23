@@ -151,6 +151,11 @@ struct Args {
     #[arg(long)]
     readout_evidence: Option<String>,
 
+    /// Require the startup readout self-check to pass before serving; the
+    /// default reports it on /health without blocking startup
+    #[arg(long)]
+    require_readout_check: bool,
+
     /// Timeout for one upstream request, in seconds
     #[arg(long, default_value_t = 600)]
     upstream_timeout_secs: u64,
@@ -185,11 +190,10 @@ async fn run_score(bridge: &Bridge, input: &Path, output: &Path) -> Result<()> {
         let row: Row = serde_json::from_str(&line)
             .with_context(|| format!("{}:{} is not a fastjev row", input.display(), index + 1))?;
         let id = row.id.clone();
-        let mut scored = bridge
-            .score_rows(&[row])
+        let scored = bridge
+            .score_row(&row)
             .await
             .with_context(|| format!("scoring row {id:?} failed"))?;
-        let scored = scored.remove(0);
         let record = serde_json::to_string(&ScoreLine {
             id: scored.answer.id,
             option_ids: scored.answer.option_ids,
@@ -386,6 +390,10 @@ async fn main() -> Result<()> {
             .zip(bridge.slots())
             .map(|(letter, id)| serde_json::json!({"letter": letter.to_string(), "token_id": id}))
             .collect();
+        let readout_check = bridge
+            .run_readout_check()
+            .await
+            .context("the readout self-check could not be run")?;
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -395,6 +403,7 @@ async fn main() -> Result<()> {
                 "probe_note": bridge.probe().note(),
                 "endpoint": bridge.probe().endpoint(),
                 "answer_slots": slots,
+                "readout_self_check": readout_check,
             }))?
         );
         return Ok(());
@@ -412,9 +421,44 @@ async fn main() -> Result<()> {
         return run_score(&bridge, &input, &output).await;
     }
 
+    // The readout self-check: a few questions whose answers are obvious, read
+    // through the exact channel every request uses. It reports; it does not
+    // block startup unless --require-readout-check says so.
+    eprintln!("running the readout self-check ...");
+    let readout_check = match bridge.run_readout_check().await {
+        Ok(check) => {
+            eprintln!(
+                "readout self-check: {}/{} probes named the expected option",
+                check.passed, check.probes
+            );
+            for result in check.results.iter().filter(|result| !result.passed) {
+                eprintln!(
+                    "  {}: expected {:?}, named {:?} (expected-option probability {:.3})",
+                    result.id, result.expected, result.argmax, result.expected_probability
+                );
+            }
+            Some(check)
+        }
+        Err(error) => {
+            eprintln!("the readout self-check could not run: {error:#}");
+            None
+        }
+    };
+    if args.require_readout_check
+        && !readout_check
+            .as_ref()
+            .is_some_and(jev_bridge::readout::ReadoutCheck::is_ok)
+    {
+        bail!(
+            "--require-readout-check: the readout self-check did not pass; the model may not \
+             answer with slot letters at all (the per-probe detail is on GET /health)"
+        );
+    }
+
     let state = Arc::new(AppState {
         bridge,
         api_key: args.api_key.clone(),
+        readout_check,
     });
     let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port))
         .await

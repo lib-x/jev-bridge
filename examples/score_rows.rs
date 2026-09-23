@@ -89,7 +89,11 @@ async fn main() -> Result<()> {
     ];
 
     let started = Instant::now();
-    let scored = bridge.score_rows(&rows).await?;
+    // Independent decisions, each carrying its own state: one readout per row.
+    let mut scored = Vec::with_capacity(rows.len());
+    for row in &rows {
+        scored.push(bridge.score_row(row).await?);
+    }
     println!("scored {} rows in {:.2?}\n", scored.len(), started.elapsed());
 
     for row in &scored {

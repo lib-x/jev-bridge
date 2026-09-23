@@ -37,11 +37,27 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-/// Build the chat messages for one decision.
+/// The serialised evidence text for one state.
 ///
-/// The payload uses Python's JSON layout so the text matches the reference
-/// implementation byte for byte.
-pub fn direct_messages(state: &Value, question: &str, options: &[RowOption]) -> Vec<ChatMessage> {
+/// A batch of questions about the same state serialises it once and reuses the
+/// text; the bytes are exactly what [`direct_messages`] embeds, which a test
+/// pins.
+pub fn evidence_json(state: &Value) -> String {
+    to_python_json(state)
+}
+
+/// Build the chat messages for one decision from an already-serialised
+/// evidence text.
+///
+/// `json.dumps` serialises a nested value exactly as it would serialise that
+/// value alone, so assembling the payload from independently serialised parts
+/// is byte-identical to serialising the whole object — a test pins that, since
+/// the byte-for-byte alignment with the reference implementation rests on it.
+pub fn direct_messages_reusing(
+    evidence: &str,
+    question: &str,
+    options: &[RowOption],
+) -> Vec<ChatMessage> {
     let entries: Vec<Value> = options
         .iter()
         .enumerate()
@@ -52,11 +68,11 @@ pub fn direct_messages(state: &Value, question: &str, options: &[RowOption]) -> 
             })
         })
         .collect();
-    let payload = json!({
-        "evidence": state,
-        "criterion": question,
-        "options": entries,
-    });
+    let payload = format!(
+        "{{\"evidence\": {evidence}, \"criterion\": {}, \"options\": {}}}",
+        to_python_json(&Value::String(question.to_string())),
+        to_python_json(&Value::Array(entries)),
+    );
     vec![
         ChatMessage {
             role: "system",
@@ -64,9 +80,17 @@ pub fn direct_messages(state: &Value, question: &str, options: &[RowOption]) -> 
         },
         ChatMessage {
             role: "user",
-            content: to_python_json(&payload),
+            content: payload,
         },
     ]
+}
+
+/// Build the chat messages for one decision.
+///
+/// The payload uses Python's JSON layout so the text matches the reference
+/// implementation byte for byte.
+pub fn direct_messages(state: &Value, question: &str, options: &[RowOption]) -> Vec<ChatMessage> {
+    direct_messages_reusing(&evidence_json(state), question, options)
 }
 
 /// SHA-256 of the rendered prompt.
@@ -405,6 +429,25 @@ mod tests {
             user.contains(r#""evidence": {"message": "hi", "count": 2}"#),
             "{user}"
         );
+    }
+
+    #[test]
+    fn reusing_the_serialised_evidence_is_byte_identical() {
+        // A batch serialises the shared state once and assembles each payload
+        // from parts; the result must be exactly what the whole-object path
+        // produces, or the byte-for-byte alignment with the reference
+        // implementation would quietly break for batched requests only.
+        let state = json!({
+            "message": "已扣款两次 charged twice",
+            "count": 2,
+            "nested": {"tags": ["a", "b"], "ok": true, "missing": null, "ratio": 0.5},
+        });
+        for question in ["Which queue?", "哪一个队列？", "quotes \" and \\ backslash"] {
+            let whole = direct_messages(&state, question, &options());
+            let reused = direct_messages_reusing(&evidence_json(&state), question, &options());
+            assert_eq!(whole[0].content, reused[0].content);
+            assert_eq!(whole[1].content, reused[1].content, "question {question:?}");
+        }
     }
 
     #[test]

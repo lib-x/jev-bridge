@@ -59,8 +59,8 @@ async fn probe_picks_the_completions_path_and_resolves_all_sixteen_slots() {
 async fn detailed_scores_expose_logprobs_and_prompt_hash() {
     let upstream = spawn_upstream(UpstreamConfig::default()).await;
     let bridge = connect(&upstream).await.unwrap();
-    let scored = bridge.score_rows(&[two_option_row()]).await.unwrap();
-    let first = &scored[0];
+    let scored = bridge.score_row(&two_option_row()).await.unwrap();
+    let first = &scored;
 
     assert_eq!(first.answer.id, "row");
     assert_eq!(first.answer.option_ids, vec!["billing", "sales"]);
@@ -79,9 +79,9 @@ async fn detailed_scores_expose_logprobs_and_prompt_hash() {
 async fn sixteen_option_decision_is_scored_from_one_prompt() {
     let upstream = spawn_upstream(UpstreamConfig::default()).await;
     let bridge = connect(&upstream).await.unwrap();
-    let scored = bridge.score_rows(&[sixteen_option_row()]).await.unwrap();
+    let scored = bridge.score_row(&sixteen_option_row()).await.unwrap();
 
-    let probabilities = &scored[0].answer.probabilities;
+    let probabilities = &scored.answer.probabilities;
     assert_eq!(probabilities.len(), 16);
     let total: f64 = probabilities.iter().sum();
     assert!((total - 1.0).abs() < 1e-9, "{total}");

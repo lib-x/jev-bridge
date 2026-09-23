@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::{extract::State, routing::post, Json, Router};
@@ -32,6 +33,25 @@ pub struct UpstreamConfig {
     /// When false, `/tokenize` answers 404, which proves a bridge configured
     /// with a local tokenizer never calls it.
     pub tokenize: bool,
+    /// How the mock answers a batched (array-`prompt`) request.
+    pub batch: BatchBehaviour,
+}
+
+/// How the mock answers a request that carries an array `prompt`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BatchBehaviour {
+    /// One choice per prompt, `index` in order: the happy path.
+    Supported,
+    /// Reject the array shape with 400, the way llama.cpp build b9590 did.
+    ShapeRejected,
+    /// Answer with one choice fewer than asked; the all-or-nothing check must
+    /// trip rather than mis-align prompts and probabilities.
+    ShortByOne,
+    /// Answer with every `index` set to 0; the permutation check must trip.
+    DuplicateIndex,
+    /// Answer 429; the bridge must propagate rather than fall back, or a
+    /// throttled endpoint would be laundered into a "successful" run.
+    Throttled,
 }
 
 impl Default for UpstreamConfig {
@@ -41,6 +61,7 @@ impl Default for UpstreamConfig {
             single_token: true,
             foreign_tokens: true,
             tokenize: true,
+            batch: BatchBehaviour::Supported,
         }
     }
 }
@@ -88,10 +109,11 @@ async fn apply_template() -> Json<Value> {
 }
 
 async fn tokenize(
-    State(config): State<UpstreamConfig>,
+    State(state): State<MockState>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let config = state.config;
     if !config.tokenize {
         return (
             axum::http::StatusCode::NOT_FOUND,
@@ -153,40 +175,131 @@ fn candidates(config: UpstreamConfig) -> Value {
     Value::Array(entries)
 }
 
-async fn completions(State(config): State<UpstreamConfig>, Json(body): Json<Value>) -> Json<Value> {
-    assert!(
-        body.get("prompt").and_then(Value::as_str).is_some(),
-        "scoring needs a prompt"
-    );
+/// The mock's shared state: the behaviour switches plus a call counter, so a
+/// test can assert how many upstream calls a request actually made.
+#[derive(Clone)]
+struct MockState {
+    config: UpstreamConfig,
+    completion_calls: Arc<AtomicUsize>,
+}
+
+async fn completions(
+    State(state): State<MockState>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    state.completion_calls.fetch_add(1, Ordering::Relaxed);
+    let config = state.config;
+
+    // A single prompt arrives as a string; a batched readout as an array.
+    let prompts: Vec<String> = match body.get("prompt") {
+        Some(Value::String(text)) => vec![text.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .expect("a batched prompt must hold strings")
+                    .to_string()
+            })
+            .collect(),
+        other => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"message": format!("prompt must be a string or an array, got {other:?}")}})),
+            )
+                .into_response()
+        }
+    };
+    let batched = prompts.len() > 1;
+
+    if batched {
+        match config.batch {
+            BatchBehaviour::ShapeRejected => {
+                // The shape llama.cpp build b9590 answered to an array prompt.
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"message": "type must be string, but is an array"}})),
+                )
+                    .into_response();
+            }
+            BatchBehaviour::Throttled => {
+                return (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error": {"message": "rate limited"}})),
+                )
+                    .into_response();
+            }
+            BatchBehaviour::Supported | BatchBehaviour::ShortByOne | BatchBehaviour::DuplicateIndex => {}
+        }
+    }
+
+    let mut choices: Vec<Value> = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let reported_index = if batched && config.batch == BatchBehaviour::DuplicateIndex {
+                0
+            } else {
+                index
+            };
+            json!({
+                "index": reported_index,
+                "finish_reason": "length",
+                "logprobs": {"content": [{
+                    "id": slot_for('A'),
+                    "token": "A",
+                    "logprob": -1.0,
+                    "top_logprobs": candidates(config),
+                }]},
+            })
+        })
+        .collect();
+    if batched && config.batch == BatchBehaviour::ShortByOne {
+        choices.pop();
+    }
+
+    // One usage block for the whole request, counted per prompt the way the
+    // reference endpoint counts it. The bridge attaches it to the first
+    // readout, so the vector sums to exactly this number.
+    let prompt_tokens = 42 * prompts.len() as u64;
     Json(json!({
-        "choices": [{
-            "finish_reason": "length",
-            "logprobs": {"content": [{
-                "id": slot_for('A'),
-                "token": "A",
-                "logprob": -1.0,
-                "top_logprobs": candidates(config),
-            }]},
-        }],
-        "usage": {"prompt_tokens": 42, "completion_tokens": 1, "total_tokens": 43},
+        "choices": choices,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": prompts.len(),
+            "total_tokens": prompt_tokens + prompts.len() as u64,
+        },
     }))
+    .into_response()
 }
 
 /// Run a mock llama.cpp-shaped upstream, returning its base URL.
 pub async fn spawn_upstream(config: UpstreamConfig) -> String {
+    spawn_upstream_counting(config).await.0
+}
+
+/// Like [`spawn_upstream`], and also hands back the number of
+/// `/v1/completions` calls the mock has served, so a test can prove a request
+/// was read in one batch (1) or fell back to sequential calls (N).
+pub async fn spawn_upstream_counting(config: UpstreamConfig) -> (String, Arc<AtomicUsize>) {
+    let completion_calls = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/apply-template", post(apply_template))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
         .route("/v1/completions", post(completions))
         .route("/completion", post(completions))
-        .with_state(config);
+        .with_state(MockState {
+            config,
+            completion_calls: completion_calls.clone(),
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://{address}")
+    (format!("http://{address}"), completion_calls)
 }
 
 pub fn config_for(upstream: &str) -> BridgeConfig {
@@ -243,9 +356,19 @@ impl RunningBridge {
     }
 
     pub async fn serve(bridge: Bridge, api_key: Option<&str>) -> Self {
+        Self::serve_with_check(bridge, api_key, None).await
+    }
+
+    /// Serve with a startup readout self-check attached, as `main` does.
+    pub async fn serve_with_check(
+        bridge: Bridge,
+        api_key: Option<&str>,
+        readout_check: Option<jev_bridge::readout::ReadoutCheck>,
+    ) -> Self {
         let state = Arc::new(AppState {
             bridge,
             api_key: api_key.map(str::to_string),
+            readout_check,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

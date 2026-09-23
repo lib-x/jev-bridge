@@ -211,6 +211,37 @@ The bridge itself performs no calibration and recommends no thresholds — this
 measures whether the probabilities are usable on your workload, and nothing
 more.
 
+### Batched readout
+
+Several questions in one System One request share one `state`, so the bridge
+reads them in **one** upstream request (an array `prompt`), letting a
+prefix-caching server prefill the shared state once. Measured on llama.cpp
+b11096 with a 9B Q8_0 model, 3 questions per arm, fresh prompts every round,
+arms interleaved:
+
+| Path | 3-question request (median) | Per question |
+|---|---|---|
+| batched (1 request) | **6.94 s** | 2312 ms |
+| sequential (3 requests) | 8.64 s | 2880 ms |
+| speedup | **1.25x** | — |
+
+The win is bounded by what the server can share — here the prefill of a
+~100-token prefix — so it is a 1.25x, not an order of magnitude. When the
+endpoint rejects the array shape (llama.cpp builds before b11065 answered
+`400`), the bridge falls back to sequential single-prompt calls; the fallback
+is **counted** and reported as `batch_fallbacks` on `GET /health`, because a
+run served that way did not get the shared prefill. A 429, 401/403 or 5xx is
+never treated as a shape rejection — it propagates, so a throttled endpoint
+cannot be laundered into a "successful" run.
+
+Batched responses are read **all-or-nothing**: a different number of choices
+than prompts, `index` fields that are not a permutation of `0..N`, or any
+choice without a usable distribution fails the whole request. A partial
+success would silently mis-align prompts and probabilities. The endpoint's one
+`usage` block is attached to the first answer (the rest report 0), so summing
+`input_tokens` reproduces the endpoint's own count instead of a faked
+per-prompt split.
+
 ## Endpoints
 
 | Method | Path | Description |
@@ -233,6 +264,18 @@ quality at runtime without gold data, so the deployment has to say whether it
 checked — `--evaluate` over an alignment run is exactly that check. `GET /health`
 reports the same declaration.
 
+`GET /health` also carries two runtime facts:
+
+- `readout_check` — the startup self-check, when one ran: a few questions whose
+  answers are obvious (`Is ice hotter than boiling water?`), read through the
+  exact slot channel every request uses. It cannot prove the model is *good* at
+  decisions (that needs a gold-labelled workload); it catches the model that is
+  not answering the question at all. `--require-readout-check` turns a failed
+  check into a refusal to start.
+- `batch_fallbacks` — how many batched readouts fell back to sequential calls
+  because the endpoint rejected the array-`prompt` shape (0 = every batch got
+  the shared prefill).
+
 ## Using it as a library
 
 ```toml
@@ -245,7 +288,7 @@ serde_json = "1"
 
 ```rust
 use jev_bridge::server::{Bridge, BridgeConfig};
-use jev_bridge::wire::{Row, RowOption};
+use jev_bridge::wire::{Question, Row, RowOption};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -261,11 +304,14 @@ async fn main() -> anyhow::Result<()> {
             release_date: "2026-09-22".into(),
             chat_template_kwargs: serde_json::json!({"enable_thinking": false}),
             max_input_tokens: None,
+            local: Default::default(),
+            readout: Default::default(),
         },
     )
     .await?;
 
-    let rows = vec![Row {
+    // One decision that carries its own state (the `--score` shape).
+    let row = Row {
         id: "ticket".into(),
         state: serde_json::json!("I was charged twice."),
         question: "Which queue should handle this?".into(),
@@ -273,9 +319,29 @@ async fn main() -> anyhow::Result<()> {
             RowOption { id: "billing".into(), description: "Refunds and payments.".into() },
             RowOption { id: "sales".into(), description: "Pricing.".into() },
         ],
-    }];
+    };
+    let score = bridge.score_row(&row).await?;
+    println!("{} {:?}", score.answer.id, score.answer.probabilities);
 
-    for score in bridge.score_rows(&rows).await? {
+    // Several questions about one state (the System One shape): the state is
+    // serialised once, and the whole batch is read in one upstream request.
+    let questions = vec![
+        Question {
+            id: "queue".into(),
+            question: "Which queue should handle this?".into(),
+            options: row.options.clone(),
+        },
+        Question {
+            id: "urgent".into(),
+            question: "Is this urgent?".into(),
+            options: vec![
+                RowOption { id: "true".into(), description: "Yes".into() },
+                RowOption { id: "false".into(), description: "No".into() },
+            ],
+        },
+    ];
+    let state = serde_json::json!("I was charged twice.");
+    for score in bridge.score_questions(&state, &questions).await? {
         println!("{} {:?}", score.answer.id, score.answer.probabilities);
     }
     Ok(())
@@ -288,7 +354,7 @@ Serve the same bridge over HTTP with `jev_bridge::server::router`:
 use std::sync::Arc;
 use jev_bridge::server::{router, AppState};
 
-let state = Arc::new(AppState { bridge, api_key: None });
+let state = Arc::new(AppState { bridge, api_key: None, readout_check: None });
 let listener = tokio::net::TcpListener::bind("127.0.0.1:8100").await?;
 axum::serve(listener, router(state)).await?;
 ```
@@ -297,12 +363,14 @@ Public modules:
 
 | Module | Contents |
 |---|---|
-| `server` | `Bridge`, `BridgeConfig`, `DetailedScore`, `router`, `AppState` |
-| `strategy` | `Probe`, typed request bodies, `CompletionResponse`, parsing |
+| `server` | `Bridge`, `BridgeConfig`, `DetailedScore`, `UpstreamStatus`, `router`, `AppState` |
+| `strategy` | `Probe`, typed request bodies, `CompletionResponse`, parsing, batch alignment |
 | `prompt` | prompt contract, `ChatMessage`, `RuntimeClient`, `LocalComponents`, `ChatTemplate` |
 | `render` | `LocalRenderer` — minijinja rendering with CPython string methods |
 | `tokenizer` | `LocalTokenizer` — the `tokenizers` crate behind the same checks |
-| `wire` | `SystemOneResponse`, `Answer`, request validation, `OrderedMap` |
+| `wire` | `SystemOneResponse`, `Answer`, `Row`, `Question`, `RequestBatch`, `ReadoutStatus` |
+| `evaluate` | offline calibration metrics and report verification |
+| `readout` | the startup readout self-check (`Probe`, `ReadoutCheck`) |
 
 Bodies, responses and answers are typed structs rather than loose JSON
 documents: the scoring request/response pairs, the System One response with its
@@ -441,6 +509,7 @@ numbers:
 | `--verify` / `--tol` | Recompute an evaluation report and compare it against the file |
 | `--bins` | Equal-width confidence bins for ECE and the reliability curve (default 10) |
 | `--readout-status` / `--readout-evidence` | Readout-channel declaration on `/health` and every answer (default `unvalidated`) |
+| `--require-readout-check` | Refuse to start when the startup readout self-check does not pass (default: report only) |
 | `--upstream-timeout-secs` | Timeout for one upstream request (default 600; connect timeout is 10) |
 
 `--base-url`, `--model` and `--served-model-release-date` are required unless
@@ -486,19 +555,34 @@ never written to disk.
 cargo test
 ```
 
-88 tests: 66 unit tests (wire contract, CPython JSON layout, the three response
-shapes, softmax stability, missing options must error, CPython-semantics
-template methods, and the frozen evaluation-metric definitions) plus 22
-integration tests across `tests/bridge.rs` (library API, including
-`DetailedScore` fields), `tests/contract.rs` (HTTP surface, local rendering,
-local tokenization, the readout declaration) and `tests/evaluate.rs` (the
-`--evaluate` / `--verify` CLI round trip and its failure modes: a tampered
-report, a report from other inputs, out-of-sync files).
+103 tests: 73 unit tests (wire contract, CPython JSON layout, the three
+response shapes, softmax stability, missing options must error,
+CPython-semantics template methods, the frozen evaluation-metric definitions,
+and the readout self-check's probes) plus 30 integration tests across
+`tests/bridge.rs` (library API, including `DetailedScore` fields),
+`tests/contract.rs` (HTTP surface, local rendering, local tokenization, the
+readout declaration, the readout self-check, and the batched-readout paths:
+one request for several questions, the sequential fallback and its counter,
+and the all-or-nothing failures), and `tests/evaluate.rs` (the `--evaluate` /
+`--verify` CLI round trip and its failure modes: a tampered report, a report
+from other inputs, out-of-sync files).
+
+`tests/latency.rs` is `#[ignore]`d: it measures real decision latency against
+a reachable upstream (endpoint, model and key come from
+`JEV_BRIDGE_UPSTREAM_URL` / `JEV_BRIDGE_MODEL` / `JEV_BRIDGE_UPSTREAM_KEY`,
+nothing is written to disk):
+
+```bash
+JEV_BRIDGE_UPSTREAM_URL=... JEV_BRIDGE_MODEL=... JEV_BRIDGE_UPSTREAM_KEY=... \
+  cargo test --release --test latency -- --ignored --nocapture
+```
 
 ## Known limitations
 
-- Decisions are serialized: several questions in one request are scored one
-  after another, and upstream calls are not batched.
+- A batched readout only wins what the server can share: on llama.cpp b11096
+  with a 9B Q8_0 model it is 1.25x (the prefill of the shared state), not an
+  order of magnitude. On an endpoint whose own prefix cache already serves the
+  sequential path, it can be ~1x.
 - The upstream revision cannot be pinned by this process. Reproducibility
   depends on the upstream's own version management.
 - The alignment reference is BF16 while the bridge run is Q8_0, so the 0.0053

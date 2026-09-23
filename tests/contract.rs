@@ -9,10 +9,12 @@ mod common;
 use serde_json::json;
 
 use common::{
-    connect_with, connect_with_readout, minimal_tokenizer_json,
-    connect, sixteen_option_payload, slot_for, spawn_upstream, systemone_payload,
-    three_kind_payload, two_question_payload, RunningBridge, UpstreamConfig, LETTERS,
+    connect, connect_with, connect_with_readout, minimal_tokenizer_json,
+    sixteen_option_payload, slot_for, spawn_upstream, spawn_upstream_counting, systemone_payload,
+    three_kind_payload, two_question_payload, BatchBehaviour, RunningBridge, UpstreamConfig,
+    LETTERS,
 };
+use std::sync::atomic::Ordering;
 
 // --------------------------------------------------------------------------
 // happy paths
@@ -191,6 +193,198 @@ async fn a_declared_readout_validation_travels_with_every_answer() {
     assert_eq!(status, 200);
     assert_eq!(body["fastjev"]["readout"]["status"], "validated");
     assert_eq!(body["fastjev"]["readout"]["evidence"], evidence);
+}
+
+// --------------------------------------------------------------------------
+// batched readout
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_multi_question_request_is_read_in_one_batch() {
+    let (upstream, calls) = spawn_upstream_counting(UpstreamConfig::default()).await;
+    let bridge = RunningBridge::start(&upstream, None).await;
+    // Connecting probes transports, which spends completions calls of its own.
+    let baseline = calls.load(Ordering::Relaxed);
+    let payload = systemone_payload("I was charged twice.", three_kind_payload(), "bridge-mock");
+
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 200, "{body}");
+    // One batched readout for all three questions, not three sequential calls.
+    assert_eq!(calls.load(Ordering::Relaxed) - baseline, 1);
+    assert_eq!(body["answers"]["department"]["choice"], "billing");
+    assert_eq!(body["answers"]["severity"]["legend"]["2"], "Blocking");
+    // The endpoint's single usage block is attached once, so the vector sums
+    // to the endpoint's own count.
+    assert_eq!(body["usage"]["input_tokens"], 42 * 3);
+    let (_, health) = bridge.get("/health", None).await;
+    assert_eq!(health["batch_fallbacks"], 0);
+}
+
+#[tokio::test]
+async fn a_batch_rejected_by_shape_falls_back_to_sequential() {
+    let (upstream, calls) = spawn_upstream_counting(UpstreamConfig {
+        batch: BatchBehaviour::ShapeRejected,
+        ..Default::default()
+    })
+    .await;
+    let bridge = RunningBridge::start(&upstream, None).await;
+    let baseline = calls.load(Ordering::Relaxed);
+    let payload = systemone_payload("I was charged twice.", three_kind_payload(), "bridge-mock");
+
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 200, "{body}");
+    // The batched shape was rejected once, then three sequential reads.
+    assert_eq!(calls.load(Ordering::Relaxed) - baseline, 4);
+    assert_eq!(body["answers"]["department"]["choice"], "billing");
+    // Each sequential read reports its own prompt tokens again.
+    assert_eq!(body["usage"]["input_tokens"], 42 * 3);
+
+    // The fallback is counted and visible, never hidden: a run served this way
+    // did not get the shared prefill.
+    let (status, health) = bridge.get("/health", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(health["batch_fallbacks"], 1);
+}
+
+#[tokio::test]
+async fn a_throttled_batch_propagates_instead_of_falling_back() {
+    let (upstream, calls) = spawn_upstream_counting(UpstreamConfig {
+        batch: BatchBehaviour::Throttled,
+        ..Default::default()
+    })
+    .await;
+    let bridge = RunningBridge::start(&upstream, None).await;
+    let baseline = calls.load(Ordering::Relaxed);
+    let payload = systemone_payload("I was charged twice.", three_kind_payload(), "bridge-mock");
+
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    // 429 is about the call, not the shape: falling back would turn a
+    // throttled endpoint into a "successful" run.
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(calls.load(Ordering::Relaxed) - baseline, 1);
+    assert!(body["error"].as_str().unwrap().contains("429"), "{body}");
+}
+
+#[tokio::test]
+async fn a_short_batch_fails_loudly() {
+    let (upstream, calls) = spawn_upstream_counting(UpstreamConfig {
+        batch: BatchBehaviour::ShortByOne,
+        ..Default::default()
+    })
+    .await;
+    let bridge = RunningBridge::start(&upstream, None).await;
+    let baseline = calls.load(Ordering::Relaxed);
+    let payload = systemone_payload("I was charged twice.", three_kind_payload(), "bridge-mock");
+
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 502, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("all-or-nothing"),
+        "{body}"
+    );
+    // A short answer is a data-integrity failure, not a shape rejection:
+    // re-asking one prompt at a time cannot fix it.
+    assert_eq!(calls.load(Ordering::Relaxed) - baseline, 1);
+}
+
+#[tokio::test]
+async fn a_duplicate_index_batch_fails_loudly() {
+    let (upstream, _calls) = spawn_upstream_counting(UpstreamConfig {
+        batch: BatchBehaviour::DuplicateIndex,
+        ..Default::default()
+    })
+    .await;
+    let bridge = RunningBridge::start(&upstream, None).await;
+    let payload = systemone_payload("I was charged twice.", three_kind_payload(), "bridge-mock");
+
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 502, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("permutation"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_single_question_request_never_uses_the_array_shape() {
+    // One question is one prompt, so even an endpoint that rejects arrays
+    // answers it — and no fallback is counted.
+    let (upstream, calls) = spawn_upstream_counting(UpstreamConfig {
+        batch: BatchBehaviour::ShapeRejected,
+        ..Default::default()
+    })
+    .await;
+    let bridge = RunningBridge::start(&upstream, None).await;
+    let baseline = calls.load(Ordering::Relaxed);
+    let payload = systemone_payload(
+        "I was charged twice.",
+        json!({
+            "department": {
+                "type": "choice",
+                "instructions": "Which queue?",
+                "criteria": {"billing": "Refunds.", "sales": "Pricing."},
+            }
+        }),
+        "bridge-mock",
+    );
+
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(calls.load(Ordering::Relaxed) - baseline, 1);
+    let (_, health) = bridge.get("/health", None).await;
+    assert_eq!(health["batch_fallbacks"], 0);
+}
+
+// --------------------------------------------------------------------------
+// readout self-check
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_readout_self_check_reports_what_the_model_named() {
+    let upstream = spawn_upstream(UpstreamConfig::default()).await;
+    let bridge = connect(&upstream).await.unwrap();
+
+    let check = bridge
+        .run_readout_check()
+        .await
+        .expect("the self-check must run against the mock");
+
+    // The mock always ranks A highest, so exactly the two probes whose
+    // expected option is the first one pass — and the report says which two
+    // did not, rather than collapsing to a single number.
+    assert_eq!(check.probes, 4);
+    assert_eq!(check.passed, 2);
+    assert!(!check.is_ok());
+    let failed: Vec<&str> = check
+        .results
+        .iter()
+        .filter(|result| !result.passed)
+        .map(|result| result.id.as_str())
+        .collect();
+    assert_eq!(failed, vec!["ice-not-hot", "summer-day"]);
+
+    // The report travels to /health, so an operator can see it.
+    let bridge = RunningBridge::serve_with_check(bridge, None, Some(check)).await;
+    let (status, health) = bridge.get("/health", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(health["readout_check"]["probes"], 4);
+    assert_eq!(health["readout_check"]["passed"], 2);
+    assert_eq!(
+        health["readout_check"]["results"].as_array().unwrap().len(),
+        4
+    );
+    assert_eq!(health["readout_check"]["results"][0]["id"], "sky-is-blue");
+    assert_eq!(health["readout_check"]["results"][0]["passed"], true);
+}
+
+#[tokio::test]
+async fn health_omits_the_self_check_when_none_ran() {
+    let upstream = spawn_upstream(UpstreamConfig::default()).await;
+    let bridge = RunningBridge::start(&upstream, None).await;
+
+    let (status, health) = bridge.get("/health", None).await;
+    assert_eq!(status, 200);
+    assert!(health.get("readout_check").is_none(), "{health}");
 }
 
 // --------------------------------------------------------------------------

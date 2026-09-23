@@ -77,6 +77,16 @@ impl Probe {
         matches!(self, Probe::LogprobTokenIds | Probe::AllowedTokenIdsTopK)
     }
 
+    /// Whether this transport can read several prompts in one request.
+    ///
+    /// The OpenAI-shaped transports accept an array `prompt`, which a
+    /// prefix-caching server prefills together. llama.cpp's native
+    /// `/completion` answers an array with a bare JSON array of response
+    /// objects instead of one object, so it stays one prompt per request.
+    pub fn supports_batch(self) -> bool {
+        !matches!(self, Probe::LlamaCppNProbs)
+    }
+
     /// The path this transport posts to.
     pub fn endpoint(self) -> &'static str {
         match self {
@@ -108,6 +118,20 @@ fn top_k(probe: Probe, slot_count: usize) -> usize {
     }
 }
 
+/// The `prompt` field of an OpenAI-compatible completions request.
+///
+/// One string is the shape every runtime accepts; an array asks for several
+/// prompts in one request, which lets a prefix-caching server prefill the
+/// shared part once. Both llama.cpp and vLLM accept the array form.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum PromptField {
+    /// One prompt.
+    Single(String),
+    /// Several prompts, read in one request.
+    Batch(Vec<String>),
+}
+
 /// The request body for an OpenAI-compatible `/v1/completions` call.
 ///
 /// Optional fields are omitted rather than sent as `null`: a runtime that does
@@ -116,7 +140,7 @@ fn top_k(probe: Probe, slot_count: usize) -> usize {
 #[derive(Debug, Serialize)]
 pub struct OpenAiCompletionRequest {
     model: String,
-    prompt: String,
+    prompt: PromptField,
     /// One token is enough: only the first position's distribution is read.
     max_tokens: u32,
     /// Left at 1.0 so the returned log probabilities are the model's own.
@@ -173,12 +197,21 @@ pub enum RequestBody {
 }
 
 /// Build the scoring request for one probe.
-pub fn build_body(probe: Probe, model: &str, prompt: &str, slots: &[u32]) -> RequestBody {
+///
+/// `prompts` holds one prompt for a single readout, or several for a batched
+/// one. Only [`Probe::supports_batch`] transports accept more than one; the
+/// native transport takes the first prompt and the caller falls back to
+/// sequential calls.
+pub fn build_body(probe: Probe, model: &str, prompts: &[String], slots: &[u32]) -> RequestBody {
     let candidates = top_k(probe, slots.len());
+    let prompt = match prompts {
+        [one] => PromptField::Single(one.clone()),
+        many => PromptField::Batch(many.to_vec()),
+    };
     match probe {
         Probe::LogprobTokenIds => RequestBody::OpenAi(OpenAiCompletionRequest {
             model: model.to_string(),
-            prompt: prompt.to_string(),
+            prompt,
             max_tokens: 1,
             temperature: 1.0,
             logprobs: candidates,
@@ -188,7 +221,7 @@ pub fn build_body(probe: Probe, model: &str, prompt: &str, slots: &[u32]) -> Req
         }),
         Probe::AllowedTokenIdsTopK => RequestBody::OpenAi(OpenAiCompletionRequest {
             model: model.to_string(),
-            prompt: prompt.to_string(),
+            prompt,
             max_tokens: 1,
             temperature: 1.0,
             logprobs: candidates,
@@ -198,7 +231,7 @@ pub fn build_body(probe: Probe, model: &str, prompt: &str, slots: &[u32]) -> Req
         }),
         Probe::CompletionsTopK => RequestBody::OpenAi(OpenAiCompletionRequest {
             model: model.to_string(),
-            prompt: prompt.to_string(),
+            prompt,
             max_tokens: 1,
             temperature: 1.0,
             logprobs: candidates,
@@ -208,7 +241,7 @@ pub fn build_body(probe: Probe, model: &str, prompt: &str, slots: &[u32]) -> Req
         }),
         Probe::LlamaCppNProbs => RequestBody::LlamaCpp(LlamaCppCompletionRequest {
             model: model.to_string(),
-            prompt: prompt.to_string(),
+            prompt: prompts.first().cloned().unwrap_or_default(),
             n_predict: 1,
             n_probs: candidates,
             cache_prompt: true,
@@ -294,6 +327,10 @@ struct ChoiceLogprobs {
 
 #[derive(Debug, Deserialize)]
 struct Choice {
+    /// Which prompt of a batched request this choice answers; absent on some
+    /// servers, in which case the array position is used.
+    #[serde(default)]
+    index: Option<u64>,
     #[serde(default)]
     finish_reason: Option<String>,
     #[serde(default)]
@@ -373,16 +410,16 @@ fn collect_candidates(list: &CandidateList) -> Vec<Candidate> {
     }
 }
 
-/// Locate the candidate list for the first generated position.
+/// Locate the candidate list for the first generated position of one choice.
 ///
 /// The order within each probe is deliberate: the shape that probe is expected
 /// to receive is tried first, and the alternative is only a fallback for
 /// runtimes that answer in the other dialect.
-fn candidate_position(
+fn candidate_position_in<'a>(
     probe: Probe,
-    response: &CompletionResponse,
-) -> Result<&CandidateList> {
-    let choice = response.choices.first();
+    choice: Option<&'a Choice>,
+    response: &'a CompletionResponse,
+) -> Result<&'a CandidateList> {
     let logprobs = choice.and_then(|choice| choice.logprobs.as_ref());
     match probe {
         // llama.cpp answers `/v1/completions` with chat-shaped logprobs.
@@ -390,7 +427,7 @@ fn candidate_position(
             .and_then(|logprobs| logprobs.content.first())
             .and_then(|position| position.top_logprobs.as_ref())
             .or_else(|| logprobs.and_then(|logprobs| logprobs.top_logprobs.first()))
-            .ok_or_else(|| anyhow!("response has no candidates under choices[0].logprobs")),
+            .ok_or_else(|| anyhow!("response has no candidates under choices[].logprobs")),
         Probe::LogprobTokenIds | Probe::AllowedTokenIdsTopK => logprobs
             .and_then(|logprobs| logprobs.top_logprobs.first())
             .or_else(|| {
@@ -398,7 +435,7 @@ fn candidate_position(
                     .and_then(|logprobs| logprobs.content.first())
                     .and_then(|position| position.top_logprobs.as_ref())
             })
-            .ok_or_else(|| anyhow!("response has no candidates under choices[0].logprobs")),
+            .ok_or_else(|| anyhow!("response has no candidates under choices[].logprobs")),
         Probe::LlamaCppNProbs => response
             .completion_probabilities
             .first()
@@ -436,21 +473,91 @@ pub fn parse_logprobs(
     slots: &[u32],
     letters: &[char],
 ) -> Result<Vec<f64>> {
-    if let Some(finish) = response
-        .choices
-        .first()
-        .and_then(|choice| choice.finish_reason.as_deref())
-        && finish == "error"
-    {
-        bail!("service reported finish_reason=error");
+    let candidates = parse_candidates(probe, response)?;
+    slot_logprobs_from_candidates(&candidates, slots, letters)
+}
+
+/// Extract every prompt's candidate list from one batched readout, in request
+/// order.
+///
+/// All-or-nothing by design: a response with a different number of choices
+/// than prompts, choices whose `index` fields are not a permutation of
+/// `0..expected`, or any choice without a usable distribution fails the whole
+/// call. A partial success would silently mis-align prompts and probabilities.
+///
+/// The candidate lists stay per choice because each row declares its own
+/// option count; extracting a row's slots is
+/// [`slot_logprobs_from_candidates`]'s job.
+pub fn parse_batch_candidates(
+    probe: Probe,
+    response: &CompletionResponse,
+    expected: usize,
+) -> Result<Vec<Vec<Candidate>>> {
+    if response.choices.len() != expected {
+        bail!(
+            "the endpoint returned {} choices for {expected} prompts; a batched readout is \
+             all-or-nothing — refusing to guess which answer belongs to which prompt",
+            response.choices.len()
+        );
     }
-    let candidates = collect_candidates(candidate_position(probe, response)?);
+
+    // `index` is the server's own statement of which prompt a choice belongs
+    // to; the wire order is not guaranteed to match the request order. A choice
+    // without `index` is taken at its array position (some servers omit it for
+    // single-element batches).
+    let mut order: Vec<usize> = Vec::with_capacity(response.choices.len());
+    for (position, choice) in response.choices.iter().enumerate() {
+        let index = match choice.index {
+            Some(index) => usize::try_from(index).with_context(|| {
+                format!("batched choice {position} has an `index` that does not fit this platform")
+            })?,
+            None => position,
+        };
+        order.push(index);
+    }
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    if sorted != (0..expected).collect::<Vec<usize>>() {
+        bail!(
+            "batched choices' `index` fields are not a permutation of 0..{expected}: {order:?}"
+        );
+    }
+
+    let mut readouts: Vec<Option<Vec<Candidate>>> = vec![None; expected];
+    for (choice, index) in response.choices.iter().zip(order) {
+        if let Some(finish) = choice.finish_reason.as_deref()
+            && finish == "error"
+        {
+            bail!("service reported finish_reason=error for prompt {index}");
+        }
+        let candidates = collect_candidates(candidate_position_in(probe, Some(choice), response)?);
+        if candidates.is_empty() {
+            bail!("prompt {index}: the returned distribution contains no usable candidates");
+        }
+        readouts[index] = Some(candidates);
+    }
+    Ok(readouts
+        .into_iter()
+        .map(|readout| readout.expect("every index in 0..expected was assigned"))
+        .collect())
+}
+
+/// One option distribution's log probabilities for the requested slots, in
+/// slot order.
+///
+/// A missing slot is an error rather than a zero: silently dropping an option
+/// would change the meaning of the returned distribution.
+pub fn slot_logprobs_from_candidates(
+    candidates: &[Candidate],
+    slots: &[u32],
+    letters: &[char],
+) -> Result<Vec<f64>> {
     if candidates.is_empty() {
         bail!("returned distribution contains no usable candidates");
     }
     let mut result = Vec::with_capacity(slots.len());
     for (slot, letter) in slots.iter().zip(letters) {
-        let logprob = find_candidate(&candidates, *slot, *letter).ok_or_else(|| {
+        let logprob = find_candidate(candidates, *slot, *letter).ok_or_else(|| {
             anyhow!(
                 "option token {letter:?} (id {slot}) is absent from the returned distribution; \
                  raise the requested top-k or restrict the distribution to the answer tokens"
@@ -479,8 +586,17 @@ pub fn candidates_restricted_to(candidates: &[Candidate], slots: &[u32], letters
 }
 
 /// Decode the returned candidates without requiring any slot to be present.
+///
+/// A `finish_reason` of `error` is rejected here: such a response's
+/// distribution is not one the caller asked for.
 pub fn parse_candidates(probe: Probe, response: &CompletionResponse) -> Result<Vec<Candidate>> {
-    Ok(collect_candidates(candidate_position(probe, response)?))
+    let choice = response.choices.first();
+    if let Some(finish) = choice.and_then(|choice| choice.finish_reason.as_deref())
+        && finish == "error"
+    {
+        bail!("service reported finish_reason=error");
+    }
+    Ok(collect_candidates(candidate_position_in(probe, choice, response)?))
 }
 
 /// The prompt length the runtime reported, or zero when it reported none.
@@ -527,7 +643,8 @@ mod tests {
 
     #[test]
     fn logprob_token_ids_body_restricts_and_selects() {
-        let RequestBody::OpenAi(body) = build_body(Probe::LogprobTokenIds, "m", "prompt", &[32, 33])
+        let RequestBody::OpenAi(body) =
+            build_body(Probe::LogprobTokenIds, "m", &["prompt".to_string()], &[32, 33])
         else {
             panic!("this probe speaks the OpenAI dialect");
         };
@@ -548,7 +665,8 @@ mod tests {
 
     #[test]
     fn llamacpp_body_neutralizes_the_sampler() {
-        let RequestBody::LlamaCpp(body) = build_body(Probe::LlamaCppNProbs, "m", "prompt", &[54, 55])
+        let RequestBody::LlamaCpp(body) =
+            build_body(Probe::LlamaCppNProbs, "m", &["prompt".to_string()], &[54, 55])
         else {
             panic!("this probe speaks the llama.cpp dialect");
         };
@@ -561,7 +679,8 @@ mod tests {
 
     #[test]
     fn an_unrestricted_probe_omits_the_vllm_only_fields() {
-        let RequestBody::OpenAi(body) = build_body(Probe::CompletionsTopK, "m", "prompt", &[54, 55])
+        let RequestBody::OpenAi(body) =
+            build_body(Probe::CompletionsTopK, "m", &["prompt".to_string()], &[54, 55])
         else {
             panic!("this probe speaks the OpenAI dialect");
         };

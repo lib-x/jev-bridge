@@ -190,6 +190,29 @@ gold 每行是 `{"id", "gold", "family"?, "positive"?}`。`family` 是分层键�
 
 桥接层自身不做校准、不推荐阈值——这里只测量概率在你的负载上是否可用，仅此而已。
 
+### 批量读
+
+一个 System One 请求里的多个问题共享同一个 `state`，所以桥接层用**一次**上游请求
+（数组 `prompt`）读完它们，让带前缀缓存的服务端只 prefill 一次共享前缀。在 llama.cpp
+b11096 + 9B Q8_0 模型上实测（每轮 3 个问题、每轮全新 prompt、两种路径交替）：
+
+| 路径 | 3 问题请求（中位数） | 每问题 |
+|---|---|---|
+| 批量（1 次请求） | **6.94 s** | 2312 ms |
+| 逐条（3 次请求） | 8.64 s | 2880 ms |
+| 加速比 | **1.25x** | — |
+
+收益的上限就是服务端能共享的部分（这里是一个 ~100 token 前缀的 prefill），所以是
+1.25x，不是数量级。端点拒绝数组形状时（b11065 之前的 llama.cpp 构建返回 `400`），
+桥接层回退为逐条单 prompt 请求；回退会被**计数**并出现在 `GET /health` 的
+`batch_fallbacks` 上——这样跑出来的结果没有拿到共享 prefill，报告里必须能看出来。
+429、401/403 或 5xx 绝不当作形状拒绝：它们直接传播，限流不会被洗成"成功"。
+
+批量响应按**全有或全无**读取：choices 数与 prompts 数不符、`index` 字段不是 `0..N`
+的排列、或任一 choice 没有可用分布，整个请求失败——部分成功会让 prompt 与概率
+静默错位。端点的那一个 `usage` 块附在第一个答案上（其余报 0），所以
+`input_tokens` 求和等于端点自己报的数，而不是伪造的按题拆分。
+
 ## 端点
 
 | 方法 | 路径 | 说明 |
@@ -208,6 +231,15 @@ readout 通道（每个答案字母一个 token、读末位 log 概率）假设�
 说明是否验证过——拿对齐运行跑一遍 `--evaluate` 就是那次验证。`GET /health`
 报告同一份声明。
 
+`GET /health` 还带两项运行时事实：
+
+- `readout_check` —— 启动自检的结果（跑过才有）：几条答案显而易见的问题
+  （`Is ice hotter than boiling water?`），走每个真实请求都在用的同一条槽位通道。
+  它不能证明模型**擅长**决策（那需要带 gold 的负载）；它抓的是"根本没在回答问题"
+  的模型。`--require-readout-check` 会把自检不通过变成拒绝启动。
+- `batch_fallbacks` —— 有多少批量读因为端点拒绝数组 `prompt` 形状而回退成逐条请求
+  （0 = 每个批次都拿到了共享 prefill）。
+
 ## 作为库使用
 
 ```toml
@@ -220,7 +252,7 @@ serde_json = "1"
 
 ```rust
 use jev_bridge::server::{Bridge, BridgeConfig};
-use jev_bridge::wire::{Row, RowOption};
+use jev_bridge::wire::{Question, Row, RowOption};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -236,11 +268,14 @@ async fn main() -> anyhow::Result<()> {
             release_date: "2026-09-22".into(),
             chat_template_kwargs: serde_json::json!({"enable_thinking": false}),
             max_input_tokens: None,
+            local: Default::default(),
+            readout: Default::default(),
         },
     )
     .await?;
 
-    let rows = vec![Row {
+    // 单条决策，自带 state（`--score` 的形状）。
+    let row = Row {
         id: "ticket".into(),
         state: serde_json::json!("I was charged twice."),
         question: "Which queue should handle this?".into(),
@@ -248,9 +283,29 @@ async fn main() -> anyhow::Result<()> {
             RowOption { id: "billing".into(), description: "Refunds and payments.".into() },
             RowOption { id: "sales".into(), description: "Pricing.".into() },
         ],
-    }];
+    };
+    let score = bridge.score_row(&row).await?;
+    println!("{} {:?}", score.answer.id, score.answer.probabilities);
 
-    for score in bridge.score_rows(&rows).await? {
+    // 多个问题共享一个 state（System One 的形状）：state 只序列化一次，
+    // 整批用一次上游请求读完。
+    let questions = vec![
+        Question {
+            id: "queue".into(),
+            question: "Which queue should handle this?".into(),
+            options: row.options.clone(),
+        },
+        Question {
+            id: "urgent".into(),
+            question: "Is this urgent?".into(),
+            options: vec![
+                RowOption { id: "true".into(), description: "Yes".into() },
+                RowOption { id: "false".into(), description: "No".into() },
+            ],
+        },
+    ];
+    let state = serde_json::json!("I was charged twice.");
+    for score in bridge.score_questions(&state, &questions).await? {
         println!("{} {:?}", score.answer.id, score.answer.probabilities);
     }
     Ok(())
@@ -263,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
 use std::sync::Arc;
 use jev_bridge::server::{router, AppState};
 
-let state = Arc::new(AppState { bridge, api_key: None });
+let state = Arc::new(AppState { bridge, api_key: None, readout_check: None });
 let listener = tokio::net::TcpListener::bind("127.0.0.1:8100").await?;
 axum::serve(listener, router(state)).await?;
 ```
@@ -272,12 +327,14 @@ axum::serve(listener, router(state)).await?;
 
 | 模块 | 内容 |
 |---|---|
-| `server` | `Bridge`、`BridgeConfig`、`DetailedScore`、`router`、`AppState` |
-| `strategy` | `Probe`、类型化的请求体、`CompletionResponse`、解析 |
+| `server` | `Bridge`、`BridgeConfig`、`DetailedScore`、`UpstreamStatus`、`router`、`AppState` |
+| `strategy` | `Probe`、类型化的请求体、`CompletionResponse`、解析、批量对齐 |
 | `prompt` | prompt 契约、`ChatMessage`、`RuntimeClient`、`LocalComponents`、`ChatTemplate` |
 | `render` | `LocalRenderer` —— minijinja 渲染 + CPython 字符串方法 |
 | `tokenizer` | `LocalTokenizer` —— `tokenizers` crate，接入同一套校验 |
-| `wire` | `SystemOneResponse`、`Answer`、请求校验、`OrderedMap` |
+| `wire` | `SystemOneResponse`、`Answer`、`Row`、`Question`、`RequestBatch`、`ReadoutStatus` |
+| `evaluate` | 离线校准指标与报告复算 |
+| `readout` | 启动 readout 自检（`Probe`、`ReadoutCheck`） |
 
 请求体、响应与答案都是类型化 struct，而不是松散的 JSON 文档：打分请求/响应对、带
 `choice`/`noul`/`score` 枚举的 System One 响应、health 负载，全都是 `Serialize`/`Deserialize`
@@ -399,6 +456,7 @@ token，该传输会被**拒绝**而不是默默采用——否则 `/health` 报
 | `--verify` / `--tol` | 重算评估报告并与文件逐项比对 |
 | `--bins` | ECE 与可靠性曲线的等宽箱数，默认 10 |
 | `--readout-status` / `--readout-evidence` | readout 通道声明，出现在 `/health` 与每个答案上（默认 `unvalidated`） |
+| `--require-readout-check` | 启动自检不通过时拒绝启动（默认只报告，不阻断） |
 | `--upstream-timeout-secs` | 单次上游请求超时秒数（默认 600；连接超时固定 10 秒） |
 
 `--base-url`、`--model` 与 `--served-model-release-date` 仅在未给 `--evaluate` 时必填；
@@ -437,16 +495,28 @@ token，该传输会被**拒绝**而不是默默采用——否则 `/health` 报
 cargo test
 ```
 
-88 个测试：66 个单元测试（wire 契约、CPython JSON 布局、三种响应形状、softmax 稳定性、
-缺失选项必须报错、CPython 语义的模板方法，以及冻结的评估指标口径），加 22 个集成测试，
-分在 `tests/bridge.rs`（库 API，含 `DetailedScore` 字段）、`tests/contract.rs`
-（HTTP 层、本地渲染、本地分词、readout 声明）和 `tests/evaluate.rs`
-（`--evaluate` / `--verify` 的 CLI 往返及其失败模式：被篡改的报告、来自其他输入的报告、
-两边不同步的文件）。
+103 个测试：73 个单元测试（wire 契约、CPython JSON 布局、三种响应形状、softmax 稳定性、
+缺失选项必须报错、CPython 语义的模板方法、冻结的评估指标口径，以及 readout 自检的探针），
+加 30 个集成测试，分在 `tests/bridge.rs`（库 API，含 `DetailedScore` 字段）、
+`tests/contract.rs`（HTTP 层、本地渲染、本地分词、readout 声明、readout 自检，
+以及批量读的各条路径：一次请求读多个问题、逐条回退及其计数、全有或全无的失败）
+和 `tests/evaluate.rs`（`--evaluate` / `--verify` 的 CLI 往返及其失败模式：
+被篡改的报告、来自其他输入的报告、两边不同步的文件）。
+
+`tests/latency.rs` 是 `#[ignore]` 的：它对着可达的上游测真实决策延迟
+（端点、模型、密钥来自 `JEV_BRIDGE_UPSTREAM_URL` / `JEV_BRIDGE_MODEL` /
+`JEV_BRIDGE_UPSTREAM_KEY`，不落盘）：
+
+```bash
+JEV_BRIDGE_UPSTREAM_URL=... JEV_BRIDGE_MODEL=... JEV_BRIDGE_UPSTREAM_KEY=... \
+  cargo test --release --test latency -- --ignored --nocapture
+```
 
 ## 已知限制
 
-- 决策串行执行：一次请求内的多个问题逐条打分，上游调用不批量并发。
+- 批量读只赢服务端能共享的部分：在 llama.cpp b11096 + 9B Q8_0 上是 1.25x
+  （共享 state 的那次 prefill），不是数量级。若端点自带的前缀缓存已经让逐条路径
+  同样受益，收益可能接近 1x。
 - 上游 revision 无法由本进程钉住，结果的可复现性取决于上游自身的版本管理。
 - 对齐验证的参考侧是 BF16，桥接侧是 Q8_0，因此 0.0053 的质量差是量化差，不是桥接差；
   要得到同精度对比需要把上游换成 BF16 服务。

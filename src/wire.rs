@@ -185,8 +185,54 @@ pub struct Row {
     pub options: Vec<RowOption>,
 }
 
-/// Validate a System One request and convert its questions to scorer rows.
-pub fn request_rows(payload: &Value, served_model: &str) -> Result<(Vec<QuestionSpec>, Vec<Row>)> {
+impl Row {
+    /// Split a row into the state it carries and the question asked about it.
+    ///
+    /// A `--score` fixture gives every row its own state; a System One request
+    /// gives one state to every question. This is the boundary between the two
+    /// shapes.
+    pub fn into_parts(self) -> (Value, Question) {
+        (
+            self.state,
+            Question {
+                id: self.id,
+                question: self.question,
+                options: self.options,
+            },
+        )
+    }
+}
+
+/// One question asked about a shared state.
+///
+/// Deliberately without a `state` field: the caller holds one state and passes
+/// it once, so a batch of questions does not copy the evidence per question.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Question {
+    /// Question id, echoed into the score.
+    pub id: String,
+    /// The criterion to apply to the state.
+    pub question: String,
+    /// Between 2 and [`MAX_OPTIONS`] options.
+    pub options: Vec<RowOption>,
+}
+
+/// A validated System One request, reduced to what the scorer needs: the one
+/// state every question shares, and the questions themselves.
+#[derive(Debug)]
+pub struct RequestBatch {
+    /// Answer-shaping specs, in question order.
+    pub specs: Vec<QuestionSpec>,
+    /// The shared evidence, handed to the scorer once rather than copied per
+    /// question.
+    pub state: Value,
+    /// The questions asked about it, in request order.
+    pub questions: Vec<Question>,
+}
+
+/// Validate a System One request and convert it to one shared state plus the
+/// questions asked about it.
+pub fn request_batch(payload: &Value, served_model: &str) -> Result<RequestBatch> {
     let body = match payload {
         Value::Object(map) => map,
         _ => return fail("body", "must be a JSON object"),
@@ -210,7 +256,7 @@ pub fn request_rows(payload: &Value, served_model: &str) -> Result<(Vec<Question
     };
 
     let mut specs = Vec::with_capacity(questions.len());
-    let mut rows = Vec::with_capacity(questions.len());
+    let mut converted = Vec::with_capacity(questions.len());
     for (question_id, question) in questions {
         if question_id.is_empty() {
             return fail("questions", "question IDs must be nonempty strings");
@@ -242,14 +288,17 @@ pub fn request_rows(payload: &Value, served_model: &str) -> Result<(Vec<Question
             option_ids,
             legend,
         });
-        rows.push(Row {
+        converted.push(Question {
             id: question_id.clone(),
-            state: state.clone(),
             question: instructions,
             options,
         });
     }
-    Ok((specs, rows))
+    Ok(RequestBatch {
+        specs,
+        state,
+        questions: converted,
+    })
 }
 
 fn validate_state(state: &Value) -> Result<()> {
@@ -715,14 +764,16 @@ mod tests {
 
     #[test]
     fn rows_render_descriptions_like_fastjev() {
-        let (specs, rows) = request_rows(&sample_payload(), "bridge-model").unwrap();
-        assert_eq!(specs.len(), 3);
-        assert_eq!(rows[1].options[0].description, "billing: Payments, invoicing, and refunds");
-        assert_eq!(rows[1].options[1].description, "technical");
-        assert_eq!(rows[2].options[2].description, "Level 2: Blocking");
-        assert_eq!(rows[0].options[0].description, "true: The answer is yes.");
-        assert_eq!(specs[2].legend, vec!["Minor", "Degraded", "Blocking"]);
-        assert_eq!(rows[1].question, "Which team should handle this?");
+        let batch = request_batch(&sample_payload(), "bridge-model").unwrap();
+        assert_eq!(batch.specs.len(), 3);
+        assert_eq!(batch.questions[1].options[0].description, "billing: Payments, invoicing, and refunds");
+        assert_eq!(batch.questions[1].options[1].description, "technical");
+        assert_eq!(batch.questions[2].options[2].description, "Level 2: Blocking");
+        assert_eq!(batch.questions[0].options[0].description, "true: The answer is yes.");
+        assert_eq!(batch.specs[2].legend, vec!["Minor", "Degraded", "Blocking"]);
+        assert_eq!(batch.questions[1].question, "Which team should handle this?");
+        // One state, shared by every question rather than copied per question.
+        assert_eq!(batch.state, json!("Help! My payouts have been failing for three days."));
     }
 
     #[test]
@@ -735,29 +786,29 @@ mod tests {
                 "explicit_null": {"type": "noul", "criteria": {"true": null, "false": "No way."}},
             },
         });
-        let (_specs, rows) = request_rows(&payload, "m").unwrap();
-        assert_eq!(rows[0].options[0].description, "true: The answer is yes.");
-        assert_eq!(rows[0].options[1].description, "false: The answer is no.");
-        assert_eq!(rows[1].options[0].description, "true");
-        assert_eq!(rows[1].options[1].description, "false: No way.");
+        let batch = request_batch(&payload, "m").unwrap();
+        assert_eq!(batch.questions[0].options[0].description, "true: The answer is yes.");
+        assert_eq!(batch.questions[0].options[1].description, "false: The answer is no.");
+        assert_eq!(batch.questions[1].options[0].description, "true");
+        assert_eq!(batch.questions[1].options[1].description, "false: No way.");
     }
 
     #[test]
     fn model_mismatch_is_rejected() {
-        let error = request_rows(&sample_payload(), "other-model").unwrap_err();
+        let error = request_batch(&sample_payload(), "other-model").unwrap_err();
         assert!(error.0.starts_with("model: "), "{}", error.0);
     }
 
     #[test]
     fn empty_state_is_rejected() {
         let payload = json!({"model": "m", "state": "", "questions": {"q": {"type": "noul"}}});
-        let error = request_rows(&payload, "m").unwrap_err();
+        let error = request_batch(&payload, "m").unwrap_err();
         assert!(error.0.starts_with("state: "), "{}", error.0);
     }
 
     #[test]
     fn response_uses_probabilities_and_confidence() {
-        let (specs, _rows) = request_rows(&sample_payload(), "bridge-model").unwrap();
+        let batch = request_batch(&sample_payload(), "bridge-model").unwrap();
         let results = vec![
             ScoredAnswer {
                 id: "is_urgent".into(),
@@ -782,7 +833,7 @@ mod tests {
             },
         ];
         let response = serde_json::to_value(
-            response_from_results("bridge-model", &specs, &results, &ReadoutStatus::default())
+            response_from_results("bridge-model", &batch.specs, &results, &ReadoutStatus::default())
                 .unwrap(),
         )
         .unwrap();
@@ -798,7 +849,7 @@ mod tests {
 
     #[test]
     fn the_response_carries_the_declared_readout_status() {
-        let (specs, _rows) = request_rows(&sample_payload(), "bridge-model").unwrap();
+        let batch = request_batch(&sample_payload(), "bridge-model").unwrap();
         let results = vec![
             ScoredAnswer {
                 id: "is_urgent".into(),
@@ -825,7 +876,7 @@ mod tests {
 
         // Default: unvalidated, with no evidence attached.
         let response = serde_json::to_value(
-            response_from_results("bridge-model", &specs, &results, &ReadoutStatus::default())
+            response_from_results("bridge-model", &batch.specs, &results, &ReadoutStatus::default())
                 .unwrap(),
         )
         .unwrap();
@@ -838,7 +889,7 @@ mod tests {
             evidence: Some("argmax agreement 139/144".to_string()),
         };
         let response = serde_json::to_value(
-            response_from_results("bridge-model", &specs, &results, &declared).unwrap(),
+            response_from_results("bridge-model", &batch.specs, &results, &declared).unwrap(),
         )
         .unwrap();
         assert_eq!(response["fastjev"]["readout"]["status"], "validated");
@@ -855,7 +906,7 @@ mod tests {
 
     #[test]
     fn mismatched_result_is_rejected() {
-        let (specs, _rows) = request_rows(&sample_payload(), "bridge-model").unwrap();
+        let batch = request_batch(&sample_payload(), "bridge-model").unwrap();
         let results = vec![ScoredAnswer {
             id: "is_urgent".into(),
             option_ids: vec!["false".into(), "true".into()],
@@ -864,7 +915,7 @@ mod tests {
             prompt_version: None,
         }];
         assert!(
-            response_from_results("bridge-model", &specs, &results, &ReadoutStatus::default())
+            response_from_results("bridge-model", &batch.specs, &results, &ReadoutStatus::default())
                 .is_err()
         );
     }

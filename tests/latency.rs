@@ -26,7 +26,7 @@
 use std::time::Instant;
 
 use jev_bridge::server::{Bridge, BridgeConfig};
-use jev_bridge::wire::{Row, RowOption};
+use jev_bridge::wire::{Question, Row, RowOption};
 use serde_json::json;
 
 const STATE: &str = "My payouts have been failing for 3 days. I was charged twice and need a refund today.";
@@ -127,12 +127,23 @@ fn identical_rows(count: usize) -> Vec<Row> {
 
 /// Score one request and return (elapsed ms, total prompt tokens).
 ///
+/// Every row in this suite shares one state (the System One shape), so the
+/// rows are scored as **one batch** — which is what the measurement is about.
 /// Every answer is checked for a probability vector that sums to one: a
 /// latency number for a wrong answer would be worthless.
 async fn timed_score(bridge: &Bridge, rows: &[Row]) -> (f64, u64) {
+    let state = rows[0].state.clone();
+    let questions: Vec<Question> = rows
+        .iter()
+        .map(|row| Question {
+            id: row.id.clone(),
+            question: row.question.clone(),
+            options: row.options.clone(),
+        })
+        .collect();
     let started = Instant::now();
     let scored = bridge
-        .score_rows(rows)
+        .score_questions(&state, &questions)
         .await
         .expect("scoring must succeed against a reachable upstream");
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;

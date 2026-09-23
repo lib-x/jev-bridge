@@ -27,6 +27,10 @@
 //! * [`evaluate`] turns `--score` predictions plus a gold file into offline
 //!   calibration metrics (accuracy, NLL, Brier, ECE, reliability curve) and
 //!   recomputes a written report for verification.
+//! * [`readout`] runs the startup self-check: a few questions with obvious
+//!   answers, read through the same slot channel every request uses, so a
+//!   model that is not answering the question at all is visible instead of
+//!   silently confident.
 //!
 //! The `jev-bridge` binary is a thin CLI over [`server::Bridge`].
 //!
@@ -39,6 +43,7 @@
 
 pub mod evaluate;
 pub mod prompt;
+pub mod readout;
 pub mod render;
 pub mod server;
 pub mod strategy;

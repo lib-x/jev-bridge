@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         bridge,
         api_key: std::env::var("JEV_BRIDGE_API_KEY").ok(),
+        readout_check: None,
     });
     let listener = tokio::net::TcpListener::bind(ADDRESS)
         .await
