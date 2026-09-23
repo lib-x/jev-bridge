@@ -390,18 +390,36 @@ llama.cpp 自己的 `/apply-template` 输出做过逐字节比对。
 
 ## Examples
 
-`examples/` 下有三个可直接运行的示例，配置全部从环境变量读取，没有硬编码任何凭据：
+`examples/` 下有四个可直接运行的示例，配置全部从环境变量（或参数）读取，没有硬编码任何凭据：
 
 | 示例 | 展示内容 |
 |---|---|
 | `cargo run --example score_rows` | 连接 `Bridge`、给 rows 打分、读取 `DetailedScore` |
 | `cargo run --example serve` | 用 `router` 把同一个 bridge 挂成 HTTP 服务 |
 | `cargo run --example local_template` | 在本地渲染模板并检查渲染出的 prompt |
+| `cargo run --example playground` | 把 [djev-run](https://github.com/taeold/djev-run) 的浏览器游戏（snake / dino / tetris）接到运行中的 bridge 上 |
 
 ```bash
 export JEV_BRIDGE_UPSTREAM_URL=http://127.0.0.1:8080/v1
 export JEV_BRIDGE_UPSTREAM_KEY=...        # 仅当服务端需要时
 cargo run --example score_rows
+```
+
+playground 需要一个接受 demo 硬编码 model id 的 bridge（`--accept-any-model`），
+以及一份 demo 页面的 checkout（它们没有 license，所以不随本仓库分发）：
+
+```bash
+# 终端 1：bridge
+jev-bridge --base-url http://127.0.0.1:8080/v1 --model my-model \
+  --served-model bridge-my-model --served-model-release-date 2026-09-23 \
+  --accept-any-model
+
+# 终端 2：playground
+git clone https://github.com/taeold/djev-run
+cargo run --example playground -- --demo-dir ./djev-run
+
+# 浏览器
+open http://127.0.0.1:8000/snake
 ```
 
 ## 传输探测
@@ -457,6 +475,7 @@ token，该传输会被**拒绝**而不是默默采用——否则 `/health` 报
 | `--bins` | ECE 与可靠性曲线的等宽箱数，默认 10 |
 | `--readout-status` / `--readout-evidence` | readout 通道声明，出现在 `/health` 与每个答案上（默认 `unvalidated`） |
 | `--require-readout-check` | 启动自检不通过时拒绝启动（默认只报告，不阻断） |
+| `--accept-any-model` | 接受任意非空 `model` 名，不再要求等于 `--served-model`（给硬编码模型 id 的第三方客户端用） |
 | `--upstream-timeout-secs` | 单次上游请求超时秒数（默认 600；连接超时固定 10 秒） |
 
 `--base-url`、`--model` 与 `--served-model-release-date` 仅在未给 `--evaluate` 时必填；
@@ -488,6 +507,11 @@ token，该传输会被**拒绝**而不是默默采用——否则 `/health` 报
   原始工作与证据见上游仓库。
 - [TypeSafe System One](https://docs.typesafe.ai)——wire 格式保持字段级兼容的
   公开 HTTP 契约。
+- [taeold/djev-run](https://github.com/taeold/djev-run)——把 DiffusionGemma-Jev
+  挂在 TypeSafe 兼容 API 上，并附带三个独立的浏览器游戏（snake / dino /
+  tetris），直接在浏览器里 `POST /v1/systemone`。它们通过
+  `cargo run --example playground` 接到本 bridge 上（见 Examples）；因为它们
+  硬编码 `jev-latest`，bridge 需要 `--accept-any-model`。
 
 ## 测试
 

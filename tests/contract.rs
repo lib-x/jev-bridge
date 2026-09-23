@@ -9,10 +9,10 @@ mod common;
 use serde_json::json;
 
 use common::{
-    connect, connect_with, connect_with_readout, minimal_tokenizer_json,
-    sixteen_option_payload, slot_for, spawn_upstream, spawn_upstream_counting, systemone_payload,
-    three_kind_payload, two_question_payload, BatchBehaviour, RunningBridge, UpstreamConfig,
-    LETTERS,
+    connect, connect_accepting_any_model, connect_with, connect_with_readout,
+    minimal_tokenizer_json, sixteen_option_payload, slot_for, spawn_upstream,
+    spawn_upstream_counting, systemone_payload, three_kind_payload, two_question_payload,
+    BatchBehaviour, RunningBridge, UpstreamConfig, LETTERS,
 };
 use std::sync::atomic::Ordering;
 
@@ -120,6 +120,36 @@ async fn model_mismatch_is_rejected_with_400() {
         body["error"].as_str().unwrap().contains("does not serve Jev aliases"),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn accept_any_model_admits_third_party_clients() {
+    let upstream = spawn_upstream(UpstreamConfig::default()).await;
+
+    // The default refusal names the switch that relaxes it.
+    let bridge = RunningBridge::start(&upstream, None).await;
+    let payload = systemone_payload("x", two_question_payload(), "jev-latest");
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 400);
+    assert!(
+        body["error"].as_str().unwrap().contains("--accept-any-model"),
+        "{body}"
+    );
+
+    // With the switch on, a client that hard-codes `jev-latest` (the AI SDK,
+    // the djev-run demos) is served — and the response still reports the
+    // served model, so the bridge never claims to be the alias.
+    let bridge = connect_accepting_any_model(&upstream).await.unwrap();
+    let bridge = RunningBridge::serve(bridge, None).await;
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["model"], "bridge-mock");
+    assert_eq!(body["answers"]["department"]["choice"], "billing");
+
+    // An empty name is still refused: it names nothing.
+    let payload = systemone_payload("x", two_question_payload(), "  ");
+    let (status, _body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 400);
 }
 
 #[tokio::test]

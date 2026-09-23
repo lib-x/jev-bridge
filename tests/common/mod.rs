@@ -314,6 +314,7 @@ pub fn config_for(upstream: &str) -> BridgeConfig {
         chat_template_kwargs: json!({"enable_thinking": false}),
         max_input_tokens: None,
         local: Default::default(),
+        accept_any_model: false,
         readout: Default::default(),
     }
 }
@@ -340,6 +341,14 @@ pub async fn connect_with_readout(
 ) -> anyhow::Result<Bridge> {
     let mut config = config_for(upstream);
     config.readout = readout;
+    Bridge::connect(reqwest::Client::new(), config).await
+}
+
+/// Connect with `accept_any_model` on, for third-party clients that hard-code
+/// a model id the bridge is not.
+pub async fn connect_accepting_any_model(upstream: &str) -> anyhow::Result<Bridge> {
+    let mut config = config_for(upstream);
+    config.accept_any_model = true;
     Bridge::connect(reqwest::Client::new(), config).await
 }
 

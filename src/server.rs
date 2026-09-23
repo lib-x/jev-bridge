@@ -44,6 +44,8 @@ pub struct Bridge {
     description: String,
     release_date: String,
     max_input_tokens: Option<usize>,
+    /// Accept any non-empty `model` name instead of requiring the served model.
+    accept_any_model: bool,
     /// What the deployment declared about the readout channel on this model.
     readout: ReadoutStatus,
     /// How many batched readouts were served by the sequential fallback
@@ -121,6 +123,15 @@ pub struct BridgeConfig {
     /// Render the chat template and/or tokenize in-process instead of asking
     /// the runtime.
     pub local: LocalComponents,
+    /// Accept any non-empty `model` name in a request instead of requiring the
+    /// served model.
+    ///
+    /// Off by default: the bridge does not serve model ids it is not (that is
+    /// what the `jev` prefix check on `--served-model` protects). Third-party
+    /// TypeSafe clients hard-code an id like `jev-latest`, so a deployment
+    /// that wants to serve them turns this on explicitly. Responses still
+    /// report the served model.
+    pub accept_any_model: bool,
     /// What the deployment knows about the readout channel on this model.
     ///
     /// Defaults to `unvalidated`: the bridge cannot prove readout quality at
@@ -221,6 +232,7 @@ impl Bridge {
             description: config.description,
             release_date: config.release_date,
             max_input_tokens: config.max_input_tokens,
+            accept_any_model: config.accept_any_model,
             readout: config.readout,
             batch_fallbacks: AtomicU64::new(0),
             lock: Mutex::new(()),
@@ -235,6 +247,12 @@ impl Bridge {
     /// What the deployment declared about the readout channel on this model.
     pub fn readout(&self) -> &ReadoutStatus {
         &self.readout
+    }
+
+    /// Whether any non-empty `model` name is accepted, instead of only the
+    /// served model.
+    pub fn accepts_any_model(&self) -> bool {
+        self.accept_any_model
     }
 
     /// How many batched readouts fell back to sequential requests because the
@@ -581,7 +599,11 @@ async fn systemone(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
             )
         }
     };
-    let batch = match request_batch(&payload, &state.bridge.served_model) {
+    let batch = match request_batch(
+        &payload,
+        &state.bridge.served_model,
+        state.bridge.accepts_any_model(),
+    ) {
         Ok(parsed) => parsed,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error.0),
     };

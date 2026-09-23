@@ -436,19 +436,38 @@ output on a real model template.
 
 ## Examples
 
-Three runnable examples live in `examples/`. Each reads its configuration from
-the environment, so no credentials are baked in:
+Four runnable examples live in `examples/`. Each reads its configuration from
+the environment (or flags), so no credentials are baked in:
 
 | Example | Shows |
 |---|---|
 | `cargo run --example score_rows` | connecting a `Bridge`, scoring rows, reading `DetailedScore` |
 | `cargo run --example serve` | exposing the same bridge over HTTP with `router` |
 | `cargo run --example local_template` | rendering a template in-process and inspecting the prompt |
+| `cargo run --example playground` | serving the [djev-run](https://github.com/taeold/djev-run) browser games (snake / dino / tetris) against a running bridge |
 
 ```bash
 export JEV_BRIDGE_UPSTREAM_URL=http://127.0.0.1:8080/v1
 export JEV_BRIDGE_UPSTREAM_KEY=...        # only if the server requires it
 cargo run --example score_rows
+```
+
+The playground needs a bridge that accepts the demos' hard-coded model id
+(`--accept-any-model`) and a checkout of the demo pages (they ship no license,
+so they are not bundled here):
+
+```bash
+# terminal 1: the bridge
+jev-bridge --base-url http://127.0.0.1:8080/v1 --model my-model \
+  --served-model bridge-my-model --served-model-release-date 2026-09-23 \
+  --accept-any-model
+
+# terminal 2: the playground
+git clone https://github.com/taeold/djev-run
+cargo run --example playground -- --demo-dir ./djev-run
+
+# browser
+open http://127.0.0.1:8000/snake
 ```
 
 ## Transport probing
@@ -510,6 +529,7 @@ numbers:
 | `--bins` | Equal-width confidence bins for ECE and the reliability curve (default 10) |
 | `--readout-status` / `--readout-evidence` | Readout-channel declaration on `/health` and every answer (default `unvalidated`) |
 | `--require-readout-check` | Refuse to start when the startup readout self-check does not pass (default: report only) |
+| `--accept-any-model` | Accept any non-empty `model` name instead of requiring `--served-model` (for third-party clients that hard-code an id) |
 | `--upstream-timeout-secs` | Timeout for one upstream request (default 600; connect timeout is 10) |
 
 `--base-url`, `--model` and `--served-model-release-date` are required unless
@@ -548,6 +568,11 @@ never written to disk.
   Rust; see the upstream repository for the original work and its evidence.
 - [TypeSafe System One](https://docs.typesafe.ai) — the public HTTP contract the
   wire format is field-compatible with.
+- [taeold/djev-run](https://github.com/taeold/djev-run) — serves
+  DiffusionGemma-Jev on a TypeSafe-compatible API and ships three standalone
+  browser games (snake / dino / tetris) that call `POST /v1/systemone`. They
+  play against this bridge through `cargo run --example playground` (see
+  Examples), with `--accept-any-model` because they hard-code `jev-latest`.
 
 ## Testing
 

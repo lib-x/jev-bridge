@@ -156,6 +156,11 @@ struct Args {
     #[arg(long)]
     require_readout_check: bool,
 
+    /// Accept any non-empty `model` name in a request instead of requiring
+    /// --served-model; for third-party clients that hard-code a model id
+    #[arg(long)]
+    accept_any_model: bool,
+
     /// Timeout for one upstream request, in seconds
     #[arg(long, default_value_t = 600)]
     upstream_timeout_secs: u64,
@@ -364,6 +369,7 @@ async fn main() -> Result<()> {
             renderer: local_renderer,
             tokenizer: local_tokenizer,
         },
+        accept_any_model: args.accept_any_model,
         readout: ReadoutStatus {
             status: args.readout_status.clone(),
             evidence: args.readout_evidence.clone(),

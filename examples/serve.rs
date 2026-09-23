@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
             chat_template_kwargs: json!({"enable_thinking": false}),
             max_input_tokens: None,
             local: Default::default(),
+            accept_any_model: false,
             readout: Default::default(),
         },
     )

@@ -232,7 +232,18 @@ pub struct RequestBatch {
 
 /// Validate a System One request and convert it to one shared state plus the
 /// questions asked about it.
-pub fn request_batch(payload: &Value, served_model: &str) -> Result<RequestBatch> {
+///
+/// `accept_any_model` relaxes the `model` check from "must name the served
+/// model" to "must be a non-empty string": third-party TypeSafe clients (the
+/// `@ai-sdk/typesafe-ai` SDK, the djev-run demos) hard-code a model id like
+/// `jev-latest`, and a deployment that wants to serve them can say so
+/// explicitly. The response still reports the served model, so the bridge
+/// never claims to be something it is not.
+pub fn request_batch(
+    payload: &Value,
+    served_model: &str,
+    accept_any_model: bool,
+) -> Result<RequestBatch> {
     let body = match payload {
         Value::Object(map) => map,
         _ => return fail("body", "must be a JSON object"),
@@ -241,11 +252,15 @@ pub fn request_batch(payload: &Value, served_model: &str) -> Result<RequestBatch
     validate_state(&state)?;
 
     match body.get("model") {
+        Some(Value::String(model)) if accept_any_model && !model.trim().is_empty() => {}
         Some(Value::String(model)) if model == served_model => {}
         _ => {
             return fail(
                 "model",
-                &format!("must be {served_model:?}; this server does not serve Jev aliases"),
+                &format!(
+                    "must be {served_model:?}; this server does not serve Jev aliases \
+                     (start it with --accept-any-model to accept any model name)"
+                ),
             )
         }
     }
@@ -764,7 +779,7 @@ mod tests {
 
     #[test]
     fn rows_render_descriptions_like_fastjev() {
-        let batch = request_batch(&sample_payload(), "bridge-model").unwrap();
+        let batch = request_batch(&sample_payload(), "bridge-model", false).unwrap();
         assert_eq!(batch.specs.len(), 3);
         assert_eq!(batch.questions[1].options[0].description, "billing: Payments, invoicing, and refunds");
         assert_eq!(batch.questions[1].options[1].description, "technical");
@@ -786,7 +801,7 @@ mod tests {
                 "explicit_null": {"type": "noul", "criteria": {"true": null, "false": "No way."}},
             },
         });
-        let batch = request_batch(&payload, "m").unwrap();
+        let batch = request_batch(&payload, "m", false).unwrap();
         assert_eq!(batch.questions[0].options[0].description, "true: The answer is yes.");
         assert_eq!(batch.questions[0].options[1].description, "false: The answer is no.");
         assert_eq!(batch.questions[1].options[0].description, "true");
@@ -795,20 +810,20 @@ mod tests {
 
     #[test]
     fn model_mismatch_is_rejected() {
-        let error = request_batch(&sample_payload(), "other-model").unwrap_err();
+        let error = request_batch(&sample_payload(), "other-model", false).unwrap_err();
         assert!(error.0.starts_with("model: "), "{}", error.0);
     }
 
     #[test]
     fn empty_state_is_rejected() {
         let payload = json!({"model": "m", "state": "", "questions": {"q": {"type": "noul"}}});
-        let error = request_batch(&payload, "m").unwrap_err();
+        let error = request_batch(&payload, "m", false).unwrap_err();
         assert!(error.0.starts_with("state: "), "{}", error.0);
     }
 
     #[test]
     fn response_uses_probabilities_and_confidence() {
-        let batch = request_batch(&sample_payload(), "bridge-model").unwrap();
+        let batch = request_batch(&sample_payload(), "bridge-model", false).unwrap();
         let results = vec![
             ScoredAnswer {
                 id: "is_urgent".into(),
@@ -849,7 +864,7 @@ mod tests {
 
     #[test]
     fn the_response_carries_the_declared_readout_status() {
-        let batch = request_batch(&sample_payload(), "bridge-model").unwrap();
+        let batch = request_batch(&sample_payload(), "bridge-model", false).unwrap();
         let results = vec![
             ScoredAnswer {
                 id: "is_urgent".into(),
@@ -906,7 +921,7 @@ mod tests {
 
     #[test]
     fn mismatched_result_is_rejected() {
-        let batch = request_batch(&sample_payload(), "bridge-model").unwrap();
+        let batch = request_batch(&sample_payload(), "bridge-model", false).unwrap();
         let results = vec![ScoredAnswer {
             id: "is_urgent".into(),
             option_ids: vec!["false".into(), "true".into()],
