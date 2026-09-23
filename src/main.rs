@@ -14,12 +14,13 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde_json::Value;
 
+use jev_bridge::evaluate;
 use jev_bridge::prompt::{self, LocalComponents};
 use jev_bridge::render::LocalRenderer;
 use jev_bridge::server::{router, AppState, Bridge, BridgeConfig};
 #[cfg(feature = "local-tokenizer")]
 use jev_bridge::tokenizer::LocalTokenizer;
-use jev_bridge::wire::Row;
+use jev_bridge::wire::{ReadoutStatus, Row};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -29,16 +30,16 @@ use jev_bridge::wire::Row;
 )]
 struct Args {
     /// OpenAI-compatible base URL of the upstream service, for example http://127.0.0.1:8080/v1
-    #[arg(long)]
-    base_url: String,
+    #[arg(long, required_unless_present = "evaluate")]
+    base_url: Option<String>,
 
     /// Native base URL used for llama.cpp /completion; defaults to --base-url without a trailing /v1
     #[arg(long)]
     native_base_url: Option<String>,
 
     /// Model name sent to the upstream service
-    #[arg(long)]
-    model: String,
+    #[arg(long, required_unless_present = "evaluate")]
+    model: Option<String>,
 
     /// Bearer token for the upstream service; prefer the environment variable
     #[arg(long, env = "JEV_BRIDGE_UPSTREAM_KEY", hide_env_values = true)]
@@ -56,8 +57,8 @@ struct Args {
     served_model_description: String,
 
     /// ISO release date returned by GET /v1/models
-    #[arg(long)]
-    served_model_release_date: String,
+    #[arg(long, required_unless_present = "evaluate")]
+    served_model_release_date: Option<String>,
 
     /// JSON object forwarded as chat_template_kwargs when rendering the template
     #[arg(long, default_value = "{\"enable_thinking\": false}")]
@@ -109,6 +110,50 @@ struct Args {
     /// Output JSONL for --score, created fresh
     #[arg(long)]
     output: Option<PathBuf>,
+
+    /// Evaluate calibration metrics offline from --predictions and --gold, then
+    /// exit; no upstream connection is made
+    #[arg(long)]
+    evaluate: bool,
+
+    /// Predictions JSONL for --evaluate, as written by --score
+    #[arg(long, requires = "evaluate")]
+    predictions: Option<PathBuf>,
+
+    /// Gold JSONL for --evaluate: one {"id", "gold", "family"?, "positive"?}
+    /// object per line
+    #[arg(long, requires = "evaluate")]
+    gold: Option<PathBuf>,
+
+    /// Equal-width confidence bins for ECE and the reliability curve
+    #[arg(long, default_value_t = jev_bridge::evaluate::DEFAULT_BINS, requires = "evaluate")]
+    bins: usize,
+
+    /// Write the --evaluate report JSON here
+    #[arg(long, requires = "evaluate")]
+    out: Option<PathBuf>,
+
+    /// Recompute the report from --predictions and --gold and compare it
+    /// against this file; exits non-zero on any mismatch
+    #[arg(long, requires = "evaluate")]
+    verify: Option<PathBuf>,
+
+    /// Numeric tolerance for --verify comparisons
+    #[arg(long, default_value_t = 1e-12, requires = "evaluate")]
+    tol: f64,
+
+    /// Readout-channel validation status exposed to clients; conventions are
+    /// `unvalidated` (nothing was checked on this model) or `validated`
+    #[arg(long, default_value = "unvalidated")]
+    readout_status: String,
+
+    /// Free-form evidence for --readout-status, for example an alignment summary
+    #[arg(long)]
+    readout_evidence: Option<String>,
+
+    /// Timeout for one upstream request, in seconds
+    #[arg(long, default_value_t = 600)]
+    upstream_timeout_secs: u64,
 }
 
 /// One prediction line, shaped for row-by-row comparison with a reference run.
@@ -166,6 +211,48 @@ async fn run_score(bridge: &Bridge, input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The offline `--evaluate` path: metrics from two files, plus an optional
+/// verification of a written report against a fresh recomputation.
+fn run_evaluate(args: &Args) -> Result<()> {
+    let predictions_path = args
+        .predictions
+        .clone()
+        .context("--evaluate requires --predictions")?;
+    let gold_path = args.gold.clone().context("--evaluate requires --gold")?;
+    let predictions_text = std::fs::read_to_string(&predictions_path)
+        .with_context(|| format!("reading {} failed", predictions_path.display()))?;
+    let gold_text = std::fs::read_to_string(&gold_path)
+        .with_context(|| format!("reading {} failed", gold_path.display()))?;
+
+    let report = evaluate::evaluate(&predictions_text, &gold_text, args.bins)?;
+
+    if let Some(verify_path) = &args.verify {
+        let claimed_text = std::fs::read_to_string(verify_path)
+            .with_context(|| format!("reading {} failed", verify_path.display()))?;
+        let claimed: evaluate::Report = serde_json::from_str(&claimed_text)
+            .with_context(|| format!("{} is not an evaluation report", verify_path.display()))?;
+        let outcome = evaluate::verify(&claimed, &report, args.tol);
+        print!("{}", outcome.report());
+        if !outcome.is_ok() {
+            bail!(
+                "{} does not reproduce from its inputs (tolerance {})",
+                verify_path.display(),
+                args.tol
+            );
+        }
+    }
+
+    if let Some(out) = &args.out {
+        let text = serde_json::to_string_pretty(&report)?;
+        std::fs::write(out, format!("{text}\n"))
+            .with_context(|| format!("writing {} failed", out.display()))?;
+        eprintln!("wrote {}", out.display());
+    }
+
+    print!("{}", evaluate::render_table(&report));
+    Ok(())
+}
+
 fn default_native_base(base_url: &str) -> String {    let trimmed = base_url.trim_end_matches('/');
     trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
 }
@@ -185,16 +272,31 @@ fn is_iso_date(text: &str) -> bool {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.model.trim().is_empty() {
+    // `--evaluate` is fully offline: no upstream connection, no model. It runs
+    // before any of the serving configuration is validated so that an
+    // evaluation needs nothing but the two files.
+    if args.evaluate {
+        return run_evaluate(&args);
+    }
+
+    // clap enforces both via `required_unless_present = "evaluate"`.
+    let base_url = args.base_url.clone().expect("clap requires --base-url");
+    let model = args.model.clone().expect("clap requires --model");
+    let release_date = args
+        .served_model_release_date
+        .clone()
+        .expect("clap requires --served-model-release-date");
+
+    if model.trim().is_empty() {
         bail!("--model must not be empty");
     }
-    if args.base_url.trim().is_empty() {
+    if base_url.trim().is_empty() {
         bail!("--base-url must not be empty");
     }
-    if !is_iso_date(&args.served_model_release_date) {
+    if !is_iso_date(&release_date) {
         bail!("--served-model-release-date must be an ISO date such as 2026-09-18");
     }
-    let served_model = args.served_model.clone().unwrap_or_else(|| args.model.clone());
+    let served_model = args.served_model.clone().unwrap_or_else(|| model.clone());
     if served_model.to_lowercase().starts_with("jev") {
         bail!(
             "--served-model must identify this bridge and must not impersonate a Jev model or alias"
@@ -208,7 +310,7 @@ async fn main() -> Result<()> {
     let native_base = args
         .native_base_url
         .clone()
-        .unwrap_or_else(|| default_native_base(&args.base_url));
+        .unwrap_or_else(|| default_native_base(&base_url));
 
     let local_renderer = match &args.chat_template_file {
         None => None,
@@ -235,30 +337,38 @@ async fn main() -> Result<()> {
         ),
     };
 
+    // A connect timeout bounds the half-open case: the request timeout alone
+    // would let a dead upstream hold the bridge's serialized scoring path for
+    // the whole window.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(args.upstream_timeout_secs))
         .build()
         .context("building the HTTP client failed")?;
 
     let config = BridgeConfig {
-        openai_base: args.base_url.clone(),
+        openai_base: base_url.clone(),
         native_base: native_base.clone(),
-        upstream_model: args.model.clone(),
+        upstream_model: model.clone(),
         upstream_key: args.upstream_key.clone(),
         served_model: served_model.clone(),
         description: args.served_model_description.clone(),
-        release_date: args.served_model_release_date.clone(),
+        release_date: release_date.clone(),
         chat_template_kwargs,
         max_input_tokens: args.max_input_tokens,
         local: LocalComponents {
             renderer: local_renderer,
             tokenizer: local_tokenizer,
         },
+        readout: ReadoutStatus {
+            status: args.readout_status.clone(),
+            evidence: args.readout_evidence.clone(),
+        },
     };
 
     eprintln!(
         "probing upstream {} (native {}) for model {:?}",
-        args.base_url, native_base, args.model
+        base_url, native_base, model
     );
     let bridge = Bridge::connect(client, config)
         .await

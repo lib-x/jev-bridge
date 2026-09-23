@@ -21,7 +21,8 @@ use crate::strategy::{
     request_url, truncated, CompletionResponse, Probe,
 };
 use crate::wire::{
-    request_rows, response_from_results, OrderedMap, Row, ScoredAnswer, PROBABILITY_STATUS,
+    request_rows, response_from_results, OrderedMap, ReadoutStatus, Row, ScoredAnswer,
+    PROBABILITY_STATUS,
 };
 
 /// One configured bridge over a single upstream model.
@@ -38,6 +39,8 @@ pub struct Bridge {
     description: String,
     release_date: String,
     max_input_tokens: Option<usize>,
+    /// What the deployment declared about the readout channel on this model.
+    readout: ReadoutStatus,
     /// Serialize upstream work so one resident model is not driven concurrently.
     lock: Mutex<()>,
 }
@@ -65,6 +68,12 @@ pub struct BridgeConfig {
     /// Render the chat template and/or tokenize in-process instead of asking
     /// the runtime.
     pub local: LocalComponents,
+    /// What the deployment knows about the readout channel on this model.
+    ///
+    /// Defaults to `unvalidated`: the bridge cannot prove readout quality at
+    /// runtime, so a deployment that checked it (for example with
+    /// [`crate::evaluate`] over an alignment run) states so explicitly.
+    pub readout: ReadoutStatus,
 }
 
 /// A scored row plus the evidence needed to compare a bridged run against a
@@ -159,6 +168,7 @@ impl Bridge {
             description: config.description,
             release_date: config.release_date,
             max_input_tokens: config.max_input_tokens,
+            readout: config.readout,
             lock: Mutex::new(()),
         })
     }
@@ -166,6 +176,11 @@ impl Bridge {
     /// The transport negotiated at startup.
     pub fn probe(&self) -> Probe {
         self.probe
+    }
+
+    /// What the deployment declared about the readout channel on this model.
+    pub fn readout(&self) -> &ReadoutStatus {
+        &self.readout
     }
 
     /// Resolved token id for each of the sixteen answer letters.
@@ -358,7 +373,12 @@ async fn systemone(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
         }
     };
     let answers: Vec<ScoredAnswer> = results.into_iter().map(|scored| scored.answer).collect();
-    match response_from_results(&state.bridge.served_model, &specs, &answers) {
+    match response_from_results(
+        &state.bridge.served_model,
+        &specs,
+        &answers,
+        state.bridge.readout(),
+    ) {
         Ok(response) => Json(response).into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.0),
     }
@@ -394,6 +414,8 @@ struct HealthResponse {
     renders_locally: bool,
     tokenizes_locally: bool,
     probability_status: &'static str,
+    /// Whether the readout channel was validated on the served model.
+    readout: ReadoutStatus,
 }
 
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -431,6 +453,7 @@ async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         renders_locally: state.bridge.renders_locally(),
         tokenizes_locally: state.bridge.tokenizes_locally(),
         probability_status: PROBABILITY_STATUS,
+        readout: state.bridge.readout().clone(),
     })
     .into_response()
 }

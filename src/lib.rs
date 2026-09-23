@@ -24,6 +24,9 @@
 //!   and the softmax.
 //! * [`server`] holds [`server::Bridge`] and the HTTP surface.
 //! * [`wire`] validates System One requests and builds their responses.
+//! * [`evaluate`] turns `--score` predictions plus a gold file into offline
+//!   calibration metrics (accuracy, NLL, Brier, ECE, reliability curve) and
+//!   recomputes a written report for verification.
 //!
 //! The `jev-bridge` binary is a thin CLI over [`server::Bridge`].
 //!
@@ -34,6 +37,7 @@
 
 #![warn(missing_docs)]
 
+pub mod evaluate;
 pub mod prompt;
 pub mod render;
 pub mod server;

@@ -201,6 +201,7 @@ pub fn config_for(upstream: &str) -> BridgeConfig {
         chat_template_kwargs: json!({"enable_thinking": false}),
         max_input_tokens: None,
         local: Default::default(),
+        readout: Default::default(),
     }
 }
 
@@ -216,6 +217,16 @@ pub async fn connect_with(
 ) -> anyhow::Result<Bridge> {
     let mut config = config_for(upstream);
     config.local = local;
+    Bridge::connect(reqwest::Client::new(), config).await
+}
+
+/// Connect with an explicitly declared readout status.
+pub async fn connect_with_readout(
+    upstream: &str,
+    readout: jev_bridge::wire::ReadoutStatus,
+) -> anyhow::Result<Bridge> {
+    let mut config = config_for(upstream);
+    config.readout = readout;
     Bridge::connect(reqwest::Client::new(), config).await
 }
 

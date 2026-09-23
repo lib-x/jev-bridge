@@ -27,6 +27,42 @@ pub const CONFIDENCE_METHOD: &str = "one-minus-normalized-entropy";
 /// The disclaimer attached to every returned probability.
 pub const PROBABILITY_STATUS: &str = "conditional option scores; uncalibrated as decision confidence";
 
+/// The default [`ReadoutStatus::status`]: nothing was checked on this model.
+pub const UNVALIDATED_READOUT: &str = "unvalidated";
+
+/// What the deployment knows about this bridge's readout channel.
+///
+/// The readout — one token per answer letter, log probabilities at the final
+/// position — assumes the served model can actually use single-token slot
+/// letters. A general instruct model that was never trained for it does not
+/// fail loudly: it degrades silently, typically by acquiring a probability
+/// floor on a catch-all option. The bridge cannot prove readout quality at
+/// runtime without gold data, so it reports what the deployment declared:
+/// `unvalidated` by default, or `validated` with the evidence attached (for
+/// example, an alignment run scored with [`crate::evaluate`]).
+///
+/// This is deliberately separate from [`PROBABILITY_STATUS`]: that field
+/// describes what the numbers mean (conditional option scores), this one
+/// describes whether the channel that produced them was checked on this model.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReadoutStatus {
+    /// Validation status; conventions: [`UNVALIDATED_READOUT`] (the default)
+    /// or `validated`.
+    pub status: String,
+    /// Free-form evidence for the status, for example an alignment summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+impl Default for ReadoutStatus {
+    fn default() -> Self {
+        Self {
+            status: UNVALIDATED_READOUT.to_string(),
+            evidence: None,
+        }
+    }
+}
+
 /// A request that cannot be represented by the scoring backend.
 #[derive(Debug, Clone)]
 pub struct WireError(pub String);
@@ -520,6 +556,8 @@ pub struct FastjevMeta {
     pub confidence_method: &'static str,
     /// Distinct prompt versions that produced this response.
     pub prompt_versions: Vec<String>,
+    /// Whether the readout channel was validated on the served model.
+    pub readout: ReadoutStatus,
 }
 
 /// The documented System One response shape.
@@ -540,6 +578,7 @@ pub fn response_from_results(
     served_model: &str,
     specs: &[QuestionSpec],
     results: &[ScoredAnswer],
+    readout: &ReadoutStatus,
 ) -> Result<SystemOneResponse> {
     if results.len() != specs.len() {
         return Err(WireError(
@@ -621,6 +660,7 @@ pub fn response_from_results(
             probability_status: PROBABILITY_STATUS,
             confidence_method: CONFIDENCE_METHOD,
             prompt_versions,
+            readout: readout.clone(),
         },
     })
 }
@@ -742,7 +782,8 @@ mod tests {
             },
         ];
         let response = serde_json::to_value(
-            response_from_results("bridge-model", &specs, &results).unwrap(),
+            response_from_results("bridge-model", &specs, &results, &ReadoutStatus::default())
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(response["answers"]["is_urgent"]["noul"], 0.9);
@@ -753,6 +794,58 @@ mod tests {
         assert_eq!(response["answers"]["severity"]["legend"]["2"], "Blocking");
         let confidence = response["answers"]["severity"]["confidence"].as_f64().unwrap();
         assert!((confidence - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_response_carries_the_declared_readout_status() {
+        let (specs, _rows) = request_rows(&sample_payload(), "bridge-model").unwrap();
+        let results = vec![
+            ScoredAnswer {
+                id: "is_urgent".into(),
+                option_ids: vec!["true".into(), "false".into()],
+                probabilities: vec![0.9, 0.1],
+                input_tokens: 10,
+                prompt_version: Some("direct-options-v1".into()),
+            },
+            ScoredAnswer {
+                id: "department".into(),
+                option_ids: vec!["billing".into(), "technical".into()],
+                probabilities: vec![0.25, 0.75],
+                input_tokens: 20,
+                prompt_version: Some("direct-options-v1".into()),
+            },
+            ScoredAnswer {
+                id: "severity".into(),
+                option_ids: vec!["0".into(), "1".into(), "2".into()],
+                probabilities: vec![0.0, 1.0, 0.0],
+                input_tokens: 30,
+                prompt_version: Some("direct-options-v1".into()),
+            },
+        ];
+
+        // Default: unvalidated, with no evidence attached.
+        let response = serde_json::to_value(
+            response_from_results("bridge-model", &specs, &results, &ReadoutStatus::default())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["fastjev"]["readout"]["status"], UNVALIDATED_READOUT);
+        assert!(response["fastjev"]["readout"].get("evidence").is_none());
+
+        // Declared: the status and its evidence both travel with the response.
+        let declared = ReadoutStatus {
+            status: "validated".to_string(),
+            evidence: Some("argmax agreement 139/144".to_string()),
+        };
+        let response = serde_json::to_value(
+            response_from_results("bridge-model", &specs, &results, &declared).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["fastjev"]["readout"]["status"], "validated");
+        assert_eq!(
+            response["fastjev"]["readout"]["evidence"],
+            "argmax agreement 139/144"
+        );
     }
 
     #[test]
@@ -770,6 +863,9 @@ mod tests {
             input_tokens: 1,
             prompt_version: None,
         }];
-        assert!(response_from_results("bridge-model", &specs, &results).is_err());
+        assert!(
+            response_from_results("bridge-model", &specs, &results, &ReadoutStatus::default())
+                .is_err()
+        );
     }
 }

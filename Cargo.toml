@@ -1,6 +1,6 @@
 [package]
 name = "jev-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Bridge a generic OpenAI-compatible inference API into a Jev-style decision scoring service"
 license = "MIT"

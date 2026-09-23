@@ -157,6 +157,39 @@ curl http://127.0.0.1:8100/v1/systemone \
 这条路径**绕过 System One 的 criteria 渲染**（后者会给每个选项描述加上 `id: ` 前缀），
 因此与参考实现的 prompt 契约完全一致——这正是对齐验证能逐字节比较 prompt 哈希的原因。
 
+### 校准评估
+
+`--evaluate` 完全离线——不连上游，不需要 `--base-url`，也不需要 `--model`。
+它把 `--score` 的预测加一个 gold 文件算成 accuracy、balanced accuracy、NLL、
+Brier（两种口径）、ECE 与可靠性曲线，并按 family 分层：
+
+```bash
+./target/release/jev-bridge --evaluate \
+  --predictions bridge-predictions.jsonl \
+  --gold gold.jsonl \
+  --out report.json
+```
+
+gold 每行是 `{"id", "gold", "family"?, "positive"?}`。`family` 是分层键（缺省的行
+记为 `unlabelled`，绝不悄悄并进总分）；`positive` 指定 `brier_binary` 的正类，
+两槽 `true`/`false` 行默认 `true`。全部口径冻结在 [`src/evaluate.rs`](src/evaluate.rs)。
+
+报告是**主张**，预测与 gold 文件是**证据**。`--verify` 重算报告并逐字段比对，
+任何不一致都以非零退出：
+
+```bash
+./target/release/jev-bridge --evaluate \
+  --predictions bridge-predictions.jsonl \
+  --gold gold.jsonl \
+  --verify report.json        # -> "84 checks; 0 mismatches"
+```
+
+比对容差属于调用方（`--tol`，默认 `1e-12`），绝不从报告里读取——改写过的数字
+不能靠自报一个更宽的容差蒙混过关。`results/` 里的对齐 JSON 同样按这个标准要求：
+重算不出来的数字不算证据。
+
+桥接层自身不做校准、不推荐阈值——这里只测量概率在你的负载上是否可用，仅此而已。
+
 ## 端点
 
 | 方法 | 路径 | 说明 |
@@ -167,11 +200,19 @@ curl http://127.0.0.1:8100/v1/systemone \
 
 出问题时先看 `GET /health`：它把实际协商到的结果显式暴露出来，而不是让你猜服务端支持什么。
 
+每个响应的 `fastjev` 块还带 `readout` 声明：默认 `{"status": "unvalidated"}`，
+或用 `--readout-status` / `--readout-evidence` 声明部署方验证过的状态。
+readout 通道（每个答案字母一个 token、读末位 log 概率）假设被服务的模型真的会用
+单 token 槽位字母。未经此训练的通用 instruct 模型不会报错，而是静默退化（某个
+兜底选项会获得概率地板）。桥接层无法在运行时自证 readout 质量，所以必须由部署方
+说明是否验证过——拿对齐运行跑一遍 `--evaluate` 就是那次验证。`GET /health`
+报告同一份声明。
+
 ## 作为库使用
 
 ```toml
 [dependencies]
-jev-bridge = "0.1"
+jev-bridge = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
@@ -354,6 +395,14 @@ token，该传输会被**拒绝**而不是默默采用——否则 `/health` 报
 | `--api-key` | 客户端必须携带的 bearer token；建议用环境变量 `JEV_BRIDGE_API_KEY` |
 | `--probe-only` | 只探测并打印结果，然后退出 |
 | `--score` / `--input` / `--output` | 批量打分模式 |
+| `--evaluate` / `--predictions` / `--gold` / `--out` | 离线校准指标：从预测与 gold 文件计算 |
+| `--verify` / `--tol` | 重算评估报告并与文件逐项比对 |
+| `--bins` | ECE 与可靠性曲线的等宽箱数，默认 10 |
+| `--readout-status` / `--readout-evidence` | readout 通道声明，出现在 `/health` 与每个答案上（默认 `unvalidated`） |
+| `--upstream-timeout-secs` | 单次上游请求超时秒数（默认 600；连接超时固定 10 秒） |
+
+`--base-url`、`--model` 与 `--served-model-release-date` 仅在未给 `--evaluate` 时必填；
+`--evaluate` 三者都不需要。
 
 凭据只从环境变量或命令行读取，不写入任何文件。
 
@@ -368,15 +417,32 @@ token，该传输会被**拒绝**而不是默默采用——否则 `/health` 报
   这也意味着**不要**用 chat completions 端点：那条路径的 prompt 由服务端模板决定，
   无法保证与本契约一致。
 
+## 参考项目
+
+- [fastjev](https://github.com/chengyongru/fastjev)（MIT）——本项目实现的
+  `direct-options-v1` 契约，也是对齐验证所用 144 条 authored 决策的来源。
+- [jev-clone](https://github.com/alitrack/jev-clone)（Apache-2.0）——独立的、
+  契约兼容的 System One 服务，专注**测量**。[`src/evaluate.rs`](src/evaluate.rs)
+  的冻结指标口径（ECE、两种 Brier、NLL、可靠性曲线、first-max argmax 规则）
+  与手算四行测试用例沿用其公开发布的定义；`/health` 与每个答案里的 `readout`
+  声明（`--readout-status`）来自它的发现——readout 通道是模型依赖的，未受
+  单 token 槽位训练的模型不会报错，而是静默退化。本项目实现为独立 Rust 代码，
+  原始工作与证据见上游仓库。
+- [TypeSafe System One](https://docs.typesafe.ai)——wire 格式保持字段级兼容的
+  公开 HTTP 契约。
+
 ## 测试
 
 ```bash
 cargo test
 ```
 
-52 个测试：37 个单元测试（wire 契约、CPython JSON 布局、三种响应形状、softmax 稳定性、
-缺失选项必须报错、CPython 语义的模板方法），加 15 个集成测试，分在 `tests/bridge.rs`
-（库 API，含 `DetailedScore` 字段）和 `tests/contract.rs`（HTTP 层、本地渲染、本地分词）。
+88 个测试：66 个单元测试（wire 契约、CPython JSON 布局、三种响应形状、softmax 稳定性、
+缺失选项必须报错、CPython 语义的模板方法，以及冻结的评估指标口径），加 22 个集成测试，
+分在 `tests/bridge.rs`（库 API，含 `DetailedScore` 字段）、`tests/contract.rs`
+（HTTP 层、本地渲染、本地分词、readout 声明）和 `tests/evaluate.rs`
+（`--evaluate` / `--verify` 的 CLI 往返及其失败模式：被篡改的报告、来自其他输入的报告、
+两边不同步的文件）。
 
 ## 已知限制
 

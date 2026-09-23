@@ -9,7 +9,7 @@ mod common;
 use serde_json::json;
 
 use common::{
-    connect_with, minimal_tokenizer_json,
+    connect_with, connect_with_readout, minimal_tokenizer_json,
     connect, sixteen_option_payload, slot_for, spawn_upstream, systemone_payload,
     three_kind_payload, two_question_payload, RunningBridge, UpstreamConfig, LETTERS,
 };
@@ -139,6 +139,58 @@ async fn bearer_auth_is_enforced_when_configured() {
     assert_eq!(bridge.get("/health", None).await.0, 401);
     assert_eq!(bridge.get("/health", Some("wrong-token")).await.0, 401);
     assert_eq!(bridge.get("/health", Some("secret-token")).await.0, 200);
+}
+
+// --------------------------------------------------------------------------
+// readout declaration
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_readout_status_defaults_to_unvalidated() {
+    let upstream = spawn_upstream(UpstreamConfig::default()).await;
+    let bridge = RunningBridge::start(&upstream, None).await;
+
+    // Health states the default, with no evidence attached...
+    let (status, health) = bridge.get("/health", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(health["readout"]["status"], "unvalidated");
+    assert!(health["readout"].get("evidence").is_none(), "{health}");
+
+    // ...and every answer carries the same declaration.
+    let payload = systemone_payload("I was charged twice.", two_question_payload(), "bridge-mock");
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["fastjev"]["readout"]["status"], "unvalidated");
+    assert!(body["fastjev"]["readout"].get("evidence").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn a_declared_readout_validation_travels_with_every_answer() {
+    use jev_bridge::wire::ReadoutStatus;
+
+    let evidence = "argmax agreement 139/144 on fastjev authored144";
+    let upstream = spawn_upstream(UpstreamConfig::default()).await;
+    let bridge = connect_with_readout(
+        &upstream,
+        ReadoutStatus {
+            status: "validated".to_string(),
+            evidence: Some(evidence.to_string()),
+        },
+    )
+    .await
+    .expect("a declared readout status must not affect connecting");
+
+    let bridge = RunningBridge::serve(bridge, None).await;
+    let (status, health) = bridge.get("/health", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(health["readout"]["status"], "validated");
+    assert_eq!(health["readout"]["evidence"], evidence);
+
+    let payload = systemone_payload("I was charged twice.", two_question_payload(), "bridge-mock");
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["fastjev"]["readout"]["status"], "validated");
+    assert_eq!(body["fastjev"]["readout"]["evidence"], evidence);
 }
 
 // --------------------------------------------------------------------------

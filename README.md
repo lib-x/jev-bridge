@@ -171,6 +171,46 @@ option description with `id: `), so it matches the reference prompt contract
 exactly — that is why the alignment check can compare prompt hashes byte for
 byte.
 
+### Calibration evaluation
+
+`--evaluate` is fully offline — no upstream connection, no `--base-url`, no
+`--model`. It turns `--score` predictions plus a gold file into accuracy,
+balanced accuracy, NLL, Brier (both flavours), ECE and the reliability curve,
+stratified by family:
+
+```bash
+./target/release/jev-bridge --evaluate \
+  --predictions bridge-predictions.jsonl \
+  --gold gold.jsonl \
+  --out report.json
+```
+
+Gold rows are `{"id", "gold", "family"?, "positive"?}`. `family` is the
+stratification key (rows without one are reported under `unlabelled`, never
+silently pooled); `positive` names the slot used for `brier_binary` and defaults
+to `true` on a two-slot `true`/`false` row. Every definition is frozen in
+[`src/evaluate.rs`](src/evaluate.rs).
+
+A report is a *claim*; the prediction and gold files are the *evidence*.
+`--verify` recomputes the report and compares it field by field, exiting
+non-zero on any mismatch:
+
+```bash
+./target/release/jev-bridge --evaluate \
+  --predictions bridge-predictions.jsonl \
+  --gold gold.jsonl \
+  --verify report.json        # -> "84 checks; 0 mismatches"
+```
+
+The comparison tolerance belongs to the caller (`--tol`, default `1e-12`) and is
+never read out of the report, so a rewritten number cannot be laundered by
+declaring a looser tolerance. This is the standard the alignment JSON in
+`results/` is meant to meet: a number that cannot be recomputed is not evidence.
+
+The bridge itself performs no calibration and recommends no thresholds — this
+measures whether the probabilities are usable on your workload, and nothing
+more.
+
 ## Endpoints
 
 | Method | Path | Description |
@@ -182,11 +222,22 @@ byte.
 `GET /health` is the first place to look when something is off: it states what
 the bridge actually negotiated instead of leaving you to guess.
 
+Every response's `fastjev` block also carries a `readout` declaration:
+`{"status": "unvalidated"}` by default, or whatever the deployment states with
+`--readout-status` / `--readout-evidence`. The readout channel — one token per
+answer letter, log probabilities at the final position — assumes the served
+model can actually use single-token slot letters. A general instruct model that
+was never trained for it does not fail loudly; it degrades silently (a
+catch-all option acquires a probability floor). The bridge cannot prove readout
+quality at runtime without gold data, so the deployment has to say whether it
+checked — `--evaluate` over an alignment run is exactly that check. `GET /health`
+reports the same declaration.
+
 ## Using it as a library
 
 ```toml
 [dependencies]
-jev-bridge = "0.1"
+jev-bridge = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
@@ -386,6 +437,14 @@ numbers:
 | `--api-key` | Bearer token clients must present; prefer `JEV_BRIDGE_API_KEY` |
 | `--probe-only` | Probe, print the result, exit |
 | `--score` / `--input` / `--output` | Batch scoring mode |
+| `--evaluate` / `--predictions` / `--gold` / `--out` | Offline calibration metrics from predictions and a gold file |
+| `--verify` / `--tol` | Recompute an evaluation report and compare it against the file |
+| `--bins` | Equal-width confidence bins for ECE and the reliability curve (default 10) |
+| `--readout-status` / `--readout-evidence` | Readout-channel declaration on `/health` and every answer (default `unvalidated`) |
+| `--upstream-timeout-secs` | Timeout for one upstream request (default 600; connect timeout is 10) |
+
+`--base-url`, `--model` and `--served-model-release-date` are required unless
+`--evaluate` is given, which needs neither.
 
 Credentials are read from environment variables or the command line and are
 never written to disk.
@@ -403,17 +462,38 @@ never written to disk.
   **chat completions endpoint must not be used**: there the prompt is decided by
   the server's template and cannot be guaranteed to match this contract.
 
+## Related projects
+
+- [fastjev](https://github.com/chengyongru/fastjev) (MIT) — the
+  `direct-options-v1` contract this bridge implements, and the source of the 144
+  authored decisions used for the alignment run.
+- [jev-clone](https://github.com/alitrack/jev-clone) (Apache-2.0) — an
+  independent, contract-compatible System One server focused on *measurement*.
+  The frozen metric definitions in [`src/evaluate.rs`](src/evaluate.rs) (ECE,
+  both Brier flavours, NLL, the reliability curve, the first-max argmax rule)
+  and the hand-computed four-row test fixture follow its published
+  definitions; the `readout` declaration on `/health` and in every answer
+  (`--readout-status`) follows its finding that the readout channel is
+  model-dependent — a model never trained for single-token slot readout does
+  not fail loudly, it degrades silently. The implementation here is independent
+  Rust; see the upstream repository for the original work and its evidence.
+- [TypeSafe System One](https://docs.typesafe.ai) — the public HTTP contract the
+  wire format is field-compatible with.
+
 ## Testing
 
 ```bash
 cargo test
 ```
 
-52 tests: 37 unit tests (wire contract, CPython JSON layout, the three response
+88 tests: 66 unit tests (wire contract, CPython JSON layout, the three response
 shapes, softmax stability, missing options must error, CPython-semantics
-template methods) plus 15 integration tests split between `tests/bridge.rs`
-(library API, including `DetailedScore` fields) and `tests/contract.rs` (HTTP
-surface, local rendering, local tokenization).
+template methods, and the frozen evaluation-metric definitions) plus 22
+integration tests across `tests/bridge.rs` (library API, including
+`DetailedScore` fields), `tests/contract.rs` (HTTP surface, local rendering,
+local tokenization, the readout declaration) and `tests/evaluate.rs` (the
+`--evaluate` / `--verify` CLI round trip and its failure modes: a tampered
+report, a report from other inputs, out-of-sync files).
 
 ## Known limitations
 
