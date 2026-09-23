@@ -486,6 +486,52 @@ pub fn distribution_confidence(probabilities: &[f64]) -> f64 {
     (1.0 - entropy / (probabilities.len() as f64).ln()).clamp(0.0, 1.0)
 }
 
+/// The certainty proxy that turns one distribution into one number.
+///
+/// Neither formula is TypeSafe's; the response declares which one produced its
+/// `confidence` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ConfidenceMethod {
+    /// `1 - H / ln(K)`: concentration over the whole distribution.
+    #[default]
+    Entropy,
+    /// `(K * max(p) - 1) / (K - 1)`: linear in the top probability, the shape
+    /// the binary-candidate reference implementation uses.
+    MaxProbability,
+}
+
+/// The method name for [`ConfidenceMethod::MaxProbability`].
+pub const CONFIDENCE_METHOD_MAX_PROBABILITY: &str = "linear-top-probability";
+
+/// Linear top-probability certainty proxy: zero on a uniform distribution,
+/// one when a single candidate holds all the mass.
+pub fn max_probability_confidence(probabilities: &[f64]) -> f64 {
+    if probabilities.len() < 2 {
+        return 1.0;
+    }
+    let maximum = probabilities.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let count = probabilities.len() as f64;
+    ((count * maximum - 1.0) / (count - 1.0)).clamp(0.0, 1.0)
+}
+
+impl ConfidenceMethod {
+    /// The name recorded in the response.
+    pub fn name(self) -> &'static str {
+        match self {
+            ConfidenceMethod::Entropy => CONFIDENCE_METHOD,
+            ConfidenceMethod::MaxProbability => CONFIDENCE_METHOD_MAX_PROBABILITY,
+        }
+    }
+
+    /// Compute the proxy for one distribution.
+    pub fn compute(self, probabilities: &[f64]) -> f64 {
+        match self {
+            ConfidenceMethod::Entropy => distribution_confidence(probabilities),
+            ConfidenceMethod::MaxProbability => max_probability_confidence(probabilities),
+        }
+    }
+}
+
 fn normalized_probabilities(spec: &QuestionSpec, result: &ScoredAnswer) -> Result<Vec<f64>> {
     if result.id != spec.id || result.option_ids != spec.option_ids {
         return Err(WireError(format!(
@@ -643,6 +689,7 @@ pub fn response_from_results(
     specs: &[QuestionSpec],
     results: &[ScoredAnswer],
     readout: &ReadoutStatus,
+    confidence: ConfidenceMethod,
 ) -> Result<SystemOneResponse> {
     if results.len() != specs.len() {
         return Err(WireError(
@@ -700,7 +747,7 @@ pub fn response_from_results(
                     score,
                     legend,
                     probabilities: distribution,
-                    confidence: distribution_confidence(&probabilities),
+                    confidence: confidence.compute(&probabilities),
                 }
             }
         };
@@ -722,7 +769,7 @@ pub fn response_from_results(
         },
         fastjev: FastjevMeta {
             probability_status: PROBABILITY_STATUS,
-            confidence_method: CONFIDENCE_METHOD,
+            confidence_method: confidence.name(),
             prompt_versions,
             readout: readout.clone(),
         },
@@ -848,7 +895,7 @@ mod tests {
             },
         ];
         let response = serde_json::to_value(
-            response_from_results("bridge-model", &batch.specs, &results, &ReadoutStatus::default())
+            response_from_results("bridge-model", &batch.specs, &results, &ReadoutStatus::default(), ConfidenceMethod::Entropy)
                 .unwrap(),
         )
         .unwrap();
@@ -891,7 +938,7 @@ mod tests {
 
         // Default: unvalidated, with no evidence attached.
         let response = serde_json::to_value(
-            response_from_results("bridge-model", &batch.specs, &results, &ReadoutStatus::default())
+            response_from_results("bridge-model", &batch.specs, &results, &ReadoutStatus::default(), ConfidenceMethod::Entropy)
                 .unwrap(),
         )
         .unwrap();
@@ -904,7 +951,14 @@ mod tests {
             evidence: Some("argmax agreement 139/144".to_string()),
         };
         let response = serde_json::to_value(
-            response_from_results("bridge-model", &batch.specs, &results, &declared).unwrap(),
+            response_from_results(
+                "bridge-model",
+                &batch.specs,
+                &results,
+                &declared,
+                ConfidenceMethod::Entropy,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(response["fastjev"]["readout"]["status"], "validated");
@@ -930,7 +984,7 @@ mod tests {
             prompt_version: None,
         }];
         assert!(
-            response_from_results("bridge-model", &batch.specs, &results, &ReadoutStatus::default())
+            response_from_results("bridge-model", &batch.specs, &results, &ReadoutStatus::default(), ConfidenceMethod::Entropy)
                 .is_err()
         );
     }

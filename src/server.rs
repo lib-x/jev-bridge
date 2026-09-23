@@ -16,19 +16,32 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::prompt::{
-    direct_messages, direct_messages_reusing, evidence_json, prompt_sha256, softmax, ChatTemplate,
-    LocalComponents, RuntimeClient, LETTERS, PROMPT_VERSION,
+    binary_messages, direct_messages, direct_messages_reusing, evidence_json, prompt_sha256,
+    softmax, BinarySlots, ChatTemplate, LocalComponents, RuntimeClient, BINARY_PROMPT_VERSION,
+    LETTERS, PROMPT_VERSION,
 };
 use crate::strategy::{
     build_body_with_candidates, candidate_ladder, candidates_restricted_to, input_tokens,
     parse_batch_candidates, parse_candidates, parse_logprobs, request_url,
-    slot_logprobs_from_candidates, truncated, CompletionResponse, Probe,
+    slot_logprobs_from_candidates, truncated, Candidate, CompletionResponse, Probe,
 };
 use crate::wire::{
-    request_batch, response_from_results, OrderedMap, Question, ReadoutStatus, Row, ScoredAnswer,
-    PROBABILITY_STATUS,
+    request_batch, response_from_results, ConfidenceMethod, OrderedMap, Question, ReadoutStatus,
+    Row, ScoredAnswer, PROBABILITY_STATUS,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// How a question becomes probabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Scoring {
+    /// One prompt listing every option as a letter; the option letters are read
+    /// from the distribution, so a reordered option list can move the answer.
+    #[default]
+    Letters,
+    /// One prompt per option asking whether it matches; each candidate is
+    /// judged on its own, so option order cannot move the answer.
+    Binary,
+}
 
 /// One configured bridge over a single upstream model.
 pub struct Bridge {
@@ -40,6 +53,12 @@ pub struct Bridge {
     openai_base: String,
     native_base: String,
     slots: Vec<u32>,
+    /// Which contract turns a question into probabilities.
+    scoring: Scoring,
+    /// The yes/no slots a binary readout scores; `None` for the letter contract.
+    binary_slots: Option<BinarySlots>,
+    /// The certainty proxy recorded with every response.
+    confidence: ConfidenceMethod,
     served_model: String,
     description: String,
     release_date: String,
@@ -138,6 +157,10 @@ pub struct BridgeConfig {
     /// runtime, so a deployment that checked it (for example with
     /// [`crate::evaluate`] over an alignment run) states so explicitly.
     pub readout: ReadoutStatus,
+    /// Which contract turns a question into probabilities.
+    pub scoring: Scoring,
+    /// The certainty proxy recorded with every response.
+    pub confidence: ConfidenceMethod,
 }
 
 /// A scored row plus the evidence needed to compare a bridged run against a
@@ -171,6 +194,16 @@ impl Bridge {
             .resolve_slots()
             .await
             .context("resolving the single-token answer slots failed")?;
+        let binary_slots = if config.scoring == Scoring::Binary {
+            Some(
+                template
+                    .resolve_binary_slots()
+                    .await
+                    .context("resolving the yes/no answer slots failed")?,
+            )
+        } else {
+            None
+        };
 
         // A sixteen-option probe exercises the widest contract this bridge
         // serves, so a transport that passes it will hold for real requests.
@@ -228,6 +261,9 @@ impl Bridge {
             openai_base: config.openai_base,
             native_base: config.native_base,
             slots,
+            scoring: config.scoring,
+            binary_slots,
+            confidence: config.confidence,
             served_model: config.served_model,
             description: config.description,
             release_date: config.release_date,
@@ -289,6 +325,11 @@ impl Bridge {
         &self.slots
     }
 
+    /// The certainty proxy this bridge records with every response.
+    pub fn confidence_method(&self) -> ConfidenceMethod {
+        self.confidence
+    }
+
     /// The model name this bridge sends upstream.
     pub fn upstream_model(&self) -> &str {
         &self.upstream_model
@@ -335,6 +376,9 @@ impl Bridge {
         questions: &[Question],
     ) -> Result<Vec<DetailedScore>> {
         let _guard = self.lock.lock().await;
+        if self.scoring == Scoring::Binary {
+            return self.score_binary(state, questions).await;
+        }
 
         // Render up front: the evidence text is serialised once for the whole
         // batch, and every question reuses it.
@@ -399,6 +443,135 @@ impl Bridge {
                 prompt_sha256: prompt_sha256(prompt),
             })
             .collect())
+    }
+
+    /// Score every question by judging each candidate on its own.
+    ///
+    /// One prompt per candidate asks whether that candidate matches the
+    /// evidence and the model answers `yes` or `no`; the yes probabilities
+    /// become the option distribution after a linear normalization. No
+    /// candidate sees the others, so reordering the options cannot move the
+    /// answer — with the letter contract, the same two options flip when their
+    /// order flips.
+    async fn score_binary(
+        &self,
+        state: &Value,
+        questions: &[Question],
+    ) -> Result<Vec<DetailedScore>> {
+        let evidence = evidence_json(state);
+        let mut prompts = Vec::new();
+        let mut owner = Vec::new();
+        for (question_index, question) in questions.iter().enumerate() {
+            for (option_index, option) in question.options.iter().enumerate() {
+                let messages = binary_messages(&evidence, &question.question, option);
+                let prompt = self
+                    .template
+                    .render(&messages)
+                    .await
+                    .with_context(|| format!("question {:?} option {:?}", question.id, option.id))?;
+                prompts.push(prompt);
+                owner.push((question_index, option_index));
+            }
+        }
+
+        let (yes, input_tokens) = self.read_binary(&prompts).await?;
+        let mut raw: Vec<Vec<f64>> = questions
+            .iter()
+            .map(|question| vec![0.0; question.options.len()])
+            .collect();
+        for ((question_index, option_index), probability) in owner.into_iter().zip(&yes) {
+            raw[question_index][option_index] = *probability;
+        }
+        let prompt_sha256 = prompt_sha256(&prompts.join("\n"));
+
+        Ok(questions
+            .iter()
+            .zip(raw)
+            .map(|(question, raw)| {
+                let total: f64 = raw.iter().sum();
+                let probabilities: Vec<f64> = if total > 0.0 {
+                    raw.iter().map(|value| value / total).collect()
+                } else {
+                    vec![1.0 / raw.len() as f64; raw.len()]
+                };
+                DetailedScore {
+                    answer: ScoredAnswer {
+                        id: question.id.clone(),
+                        option_ids: question
+                            .options
+                            .iter()
+                            .map(|option| option.id.clone())
+                            .collect(),
+                        probabilities,
+                        input_tokens,
+                        prompt_version: Some(BINARY_PROMPT_VERSION.to_string()),
+                    },
+                    option_logprobs: raw,
+                    prompt_sha256: prompt_sha256.clone(),
+                }
+            })
+            .collect())
+    }
+
+    /// Read P(yes) for every candidate prompt, in prompt order.
+    ///
+    /// One request per candidate stays on the same single-prompt path as the
+    /// letter contract; the runtime's prefix cache reuses the shared evidence,
+    /// so the repeated prefill costs a few tokens per candidate (measured: 341
+    /// of 345 tokens cached on the reference endpoint).
+    async fn read_binary(&self, prompts: &[String]) -> Result<(Vec<f64>, u64)> {
+        let slots = self
+            .binary_slots
+            .as_ref()
+            .context("binary slots were not resolved for this bridge")?;
+        let mut yes = Vec::with_capacity(prompts.len());
+        let mut input_tokens = 0;
+        for prompt in prompts {
+            let (probability, tokens) = self.read_binary_one(prompt, slots).await?;
+            yes.push(probability);
+            input_tokens += tokens;
+        }
+        Ok((yes, input_tokens))
+    }
+
+    /// One candidate's yes/no readout, deepening top-k if the first try misses.
+    async fn read_binary_one(&self, prompt: &str, slots: &BinarySlots) -> Result<(f64, u64)> {
+        let all: Vec<u32> = slots.yes.iter().chain(slots.no.iter()).copied().collect();
+        let url = request_url(self.probe, &self.openai_base, &self.native_base);
+        let prompts = [prompt.to_string()];
+        let mut deepest = 0;
+        for candidates_requested in candidate_ladder(self.probe, all.len()) {
+            deepest = candidates_requested;
+            let body = build_body_with_candidates(
+                self.probe,
+                &self.upstream_model,
+                &prompts,
+                &all,
+                candidates_requested,
+            );
+            let response: CompletionResponse =
+                post_json(&self.client, &url, &body, self.upstream_key.as_deref()).await?;
+            if truncated(self.probe, &response) {
+                bail!(
+                    "the upstream runtime truncated a binary prompt; shorten the state or raise \
+                     its context size"
+                );
+            }
+            let tokens = input_tokens(self.probe, &response);
+            if let Some(limit) = self.max_input_tokens
+                && tokens > limit as u64
+            {
+                bail!("{tokens} input tokens exceed limit {limit}; no truncation allowed");
+            }
+            let candidates = parse_candidates(self.probe, &response)?;
+            if let Some(probability) = yes_probability(&candidates, slots) {
+                return Ok((probability, tokens));
+            }
+            if self.probe.restricts_distribution() {
+                bail!("the restricted distribution carries neither a yes nor a no token");
+            }
+        }
+        bail!("no request in the ladder returned a yes or no token (deepest: {deepest} candidates)")
     }
 
     /// One batched readout for every question, in request order.
@@ -563,6 +736,28 @@ impl Bridge {
     }
 }
 
+/// P(yes) over the yes/no slots, or `None` when either token is missing.
+///
+/// The binary contract defines one candidate's answer as the two-token softmax
+/// between `yes` and `no`, so a missing token is an error the caller retries
+/// deeper, never a zero.
+fn yes_probability(candidates: &[Candidate], slots: &BinarySlots) -> Option<f64> {
+    let logprob = |ids: &[u32]| {
+        ids.iter().find_map(|id| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.id == Some(*id))
+                .map(|candidate| candidate.logprob)
+        })
+    };
+    let yes = logprob(&slots.yes)?;
+    let no = logprob(&slots.no)?;
+    let maximum = yes.max(no);
+    let yes_mass = (yes - maximum).exp();
+    let no_mass = (no - maximum).exp();
+    Some(yes_mass / (yes_mass + no_mass))
+}
+
 async fn try_probe(
     client: &reqwest::Client,
     probe: Probe,
@@ -706,6 +901,7 @@ async fn systemone(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
         &batch.specs,
         &answers,
         state.bridge.readout(),
+        state.bridge.confidence_method(),
     ) {
         Ok(response) => Json(response).into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.0),

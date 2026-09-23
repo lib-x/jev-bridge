@@ -17,10 +17,10 @@ use serde_json::Value;
 use jev_bridge::evaluate;
 use jev_bridge::prompt::{self, LocalComponents};
 use jev_bridge::render::LocalRenderer;
-use jev_bridge::server::{router, AppState, Bridge, BridgeConfig};
+use jev_bridge::server::{router, AppState, Bridge, BridgeConfig, Scoring};
 #[cfg(feature = "local-tokenizer")]
 use jev_bridge::tokenizer::LocalTokenizer;
-use jev_bridge::wire::{ReadoutStatus, Row};
+use jev_bridge::wire::{ConfidenceMethod, ReadoutStatus, Row};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -164,6 +164,17 @@ struct Args {
     /// Timeout for one upstream request, in seconds
     #[arg(long, default_value_t = 600)]
     upstream_timeout_secs: u64,
+
+    /// How a question becomes probabilities: `letters` lists the options in
+    /// one prompt and reads their answer letters; `binary` asks about each
+    /// candidate separately, so option order cannot move the answer
+    #[arg(long, value_enum, default_value_t = Scoring::Letters)]
+    scoring: Scoring,
+
+    /// Certainty proxy recorded with every response: `entropy` is
+    /// 1 - H/ln(K); `max-probability` is linear in the top probability
+    #[arg(long, value_enum, default_value_t = ConfidenceMethod::Entropy)]
+    confidence: ConfidenceMethod,
 }
 
 /// One prediction line, shaped for row-by-row comparison with a reference run.
@@ -370,6 +381,8 @@ async fn main() -> Result<()> {
             tokenizer: local_tokenizer,
         },
         accept_any_model: args.accept_any_model,
+        scoring: args.scoring,
+        confidence: args.confidence,
         readout: ReadoutStatus {
             status: args.readout_status.clone(),
             evidence: args.readout_evidence.clone(),

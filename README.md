@@ -518,6 +518,29 @@ option become an error, and it is never a zero. The same ladder guards the
 transport probe, so a shallow first list cannot make a working transport look
 unsupported.
 
+### Option order: letters versus binary
+
+The letter contract lists every option in one prompt and reads the answer
+letters, so the model sees the options in order — and it has a position
+preference. Measured on the reference endpoint with two close options, the
+same question answered `frustrated` at 0.692 when that option came first and
+`furious` at 0.759 when the order was reversed: the answer flipped, in three
+rounds out of three.
+
+`--scoring binary` removes that dependence. Each candidate becomes its own
+prompt — `Candidate: billing` / `Does this candidate match the context?` — and
+the model answers `yes` or `no`, so no candidate sees the others. The same
+measurement then returns identical probabilities in both orders, and the
+candidate probabilities are the yes probabilities after a linear
+normalization. The cost is one upstream request per candidate; the runtime's
+prefix cache reuses the shared evidence (measured: 341 of 345 tokens cached),
+so only the question tail is prefilled again.
+
+`--confidence` picks the certainty proxy recorded with every response:
+`entropy` (the default, `1 - H/ln(K)`) or `max-probability`
+(`(K·max(p) - 1)/(K - 1)`, the shape the binary-candidate reference uses).
+Neither is TypeSafe's private formula; the response says which one it used.
+
 ## Startup contracts
 
 Two checks run before serving; failing either exits instead of scoring wrong

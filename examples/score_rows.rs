@@ -51,6 +51,8 @@ async fn main() -> Result<()> {
             max_input_tokens: None,
             local: Default::default(),
             accept_any_model: false,
+            scoring: Default::default(),
+            confidence: Default::default(),
             readout: Default::default(),
         },
     )
