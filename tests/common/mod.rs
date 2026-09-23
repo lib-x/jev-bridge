@@ -40,6 +40,8 @@ pub struct UpstreamConfig {
     /// rank a letter below the requested top-k. A deepened retry then sees
     /// every letter, which is how the bridge's retry ladder gets exercised.
     pub deep_enough: usize,
+    /// Score binary (yes/no) prompts instead of answer letters.
+    pub binary: bool,
 }
 
 /// How the mock answers a request that carries an array `prompt`.
@@ -68,6 +70,7 @@ impl Default for UpstreamConfig {
             tokenize: true,
             batch: BatchBehaviour::Supported,
             deep_enough: 0,
+            binary: false,
         }
     }
 }
@@ -110,7 +113,23 @@ pub fn minimal_tokenizer_json() -> Vec<u8> {
     .unwrap()
 }
 
-async fn apply_template() -> Json<Value> {
+async fn apply_template(State(state): State<MockState>, Json(body): Json<Value>) -> Json<Value> {
+    if state.config.binary {
+        // Echo the messages so a binary prompt stays recognisable: the fixed
+        // prompt below would hide which candidate the request asks about.
+        let text = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(|message| message.get("content").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        return Json(json!({"prompt": text}));
+    }
     Json(json!({"prompt": MOCK_PROMPT}))
 }
 
@@ -131,6 +150,10 @@ async fn tokenize(
         return Json(json!({"tokens": [1, 2]})).into_response();
     }
     let content = body.get("content").and_then(Value::as_str).unwrap_or_default();
+    if config.binary && matches!(content, "yes" | " yes" | "no" | " no") {
+        let id = if content.trim_start() == "yes" { BINARY_YES_ID } else { BINARY_NO_ID };
+        return Json(json!({"tokens": [id]})).into_response();
+    }
     let tokens: Vec<u32> = match content.strip_prefix(MOCK_PROMPT) {
         Some("") => MOCK_PROMPT_IDS.to_vec(),
         Some(tail) => {
@@ -163,7 +186,30 @@ async fn detokenize() -> Json<Value> {
 /// distribution always carries ordinary vocabulary; without them the bridge's
 /// restriction check could not tell a restricted response from an unrestricted
 /// one.
-fn candidates(config: UpstreamConfig, requested: usize) -> Value {
+/// Token id the mock scores `yes` with.
+pub const BINARY_YES_ID: u32 = 100;
+/// Token id the mock scores `no` with.
+pub const BINARY_NO_ID: u32 = 101;
+
+fn candidates(config: UpstreamConfig, requested: usize, prompt: &str) -> Value {
+    // The transport probe still asks with answer letters, so only a binary
+    // prompt — the one that asks whether a candidate matches — is scored with
+    // yes/no.
+    if config.binary && prompt.contains("Does this candidate match") {
+        // The prompt names one candidate; the one it names leans yes and any
+        // other leans no, so a test can tell an independent readout from a
+        // positional one.
+        let (yes, no) = if prompt.contains("alpha") {
+            (-0.2, -3.0)
+        } else {
+            (-3.0, -0.2)
+        };
+        return Value::Array(vec![
+            json!({"id": BINARY_YES_ID, "token": "yes", "logprob": yes}),
+            json!({"id": BINARY_NO_ID, "token": "no", "logprob": no}),
+            json!({"id": 608, "token": "The", "logprob": -20.0}),
+        ]);
+    }
     // A shallow request can miss the last letter, so a test can prove that a
     // missing slot deepens the retry instead of failing the decision.
     let letters = if config.deep_enough > 0 && requested < config.deep_enough {
@@ -257,7 +303,7 @@ async fn completions(
     let mut choices: Vec<Value> = prompts
         .iter()
         .enumerate()
-        .map(|(index, _)| {
+        .map(|(index, prompt)| {
             let reported_index = if batched && config.batch == BatchBehaviour::DuplicateIndex {
                 0
             } else {
@@ -270,7 +316,7 @@ async fn completions(
                     "id": slot_for('A'),
                     "token": "A",
                     "logprob": -1.0,
-                    "top_logprobs": candidates(config, requested),
+                    "top_logprobs": candidates(config, requested, prompt),
                 }]},
             })
         })
@@ -345,6 +391,13 @@ pub async fn connect(upstream: &str) -> anyhow::Result<Bridge> {
     Bridge::connect(reqwest::Client::new(), config_for(upstream)).await
 }
 
+/// Connect with the binary candidate contract.
+pub async fn connect_binary(upstream: &str) -> anyhow::Result<Bridge> {
+    let mut config = config_for(upstream);
+    config.scoring = jev_bridge::server::Scoring::Binary;
+    Bridge::connect(reqwest::Client::new(), config).await
+}
+
 /// Connect with in-process components, for the local-rendering and
 /// local-tokenization paths.
 pub async fn connect_with(
@@ -383,6 +436,12 @@ pub struct RunningBridge {
 impl RunningBridge {
     pub async fn start(upstream: &str, api_key: Option<&str>) -> Self {
         let bridge = connect(upstream).await.expect("the bridge should connect");
+        Self::serve(bridge, api_key).await
+    }
+
+    /// Serve a bridge running the binary candidate contract.
+    pub async fn start_binary(upstream: &str, api_key: Option<&str>) -> Self {
+        let bridge = connect_binary(upstream).await.expect("the bridge should connect");
         Self::serve(bridge, api_key).await
     }
 

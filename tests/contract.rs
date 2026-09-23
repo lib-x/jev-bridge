@@ -549,3 +549,89 @@ async fn truncated_distribution_refuses_to_start() {
         "{error:#}"
     );
 }
+
+#[tokio::test]
+async fn the_binary_contract_judges_every_candidate_in_its_own_prompt() {
+    let upstream = spawn_upstream(UpstreamConfig {
+        binary: true,
+        ..Default::default()
+    })
+    .await;
+    let bridge = RunningBridge::start_binary(&upstream, None).await;
+    let payload = systemone_payload(
+        "The customer was charged twice.",
+        json!({
+            "route": {
+                "type": "choice",
+                "instructions": "Which department should handle this request?",
+                "criteria": {"alpha": "charges and refunds", "beta": "new purchases"},
+            }
+        }),
+        "bridge-mock",
+    );
+
+    let (status, body) = bridge.post("/v1/systemone", &payload, None).await;
+    assert_eq!(status, 200, "{body}");
+    // The prompt that names alpha leans yes, so alpha wins on its own merits.
+    assert_eq!(body["answers"]["route"]["choice"], "alpha");
+    let probabilities = &body["answers"]["route"]["probabilities"];
+    assert!(
+        probabilities["alpha"].as_f64().unwrap() > probabilities["beta"].as_f64().unwrap(),
+        "{body}"
+    );
+    // The response declares the binary contract it was scored under.
+    assert_eq!(body["fastjev"]["prompt_versions"][0], "binary-candidates-v1");
+}
+
+#[tokio::test]
+async fn reordering_options_does_not_move_the_binary_answer() {
+    let upstream = spawn_upstream(UpstreamConfig {
+        binary: true,
+        ..Default::default()
+    })
+    .await;
+    let bridge = RunningBridge::start_binary(&upstream, None).await;
+    let question = |criteria: serde_json::Value| {
+        systemone_payload(
+            "The customer was charged twice.",
+            json!({
+                "route": {
+                    "type": "choice",
+                    "instructions": "Which department should handle this request?",
+                    "criteria": criteria,
+                }
+            }),
+            "bridge-mock",
+        )
+    };
+
+    let (_, forward) = bridge
+        .post(
+            "/v1/systemone",
+            &question(json!({"alpha": "charges and refunds", "beta": "new purchases"})),
+            None,
+        )
+        .await;
+    let (_, reversed) = bridge
+        .post(
+            "/v1/systemone",
+            &question(json!({"beta": "new purchases", "alpha": "charges and refunds"})),
+            None,
+        )
+        .await;
+
+    // No candidate sees the others, so its probability cannot move when the
+    // other candidate changes position. With the letter contract the same swap
+    // flips the answer (measured on the reference endpoint).
+    for option in ["alpha", "beta"] {
+        assert_eq!(
+            forward["answers"]["route"]["probabilities"][option],
+            reversed["answers"]["route"]["probabilities"][option],
+            "{option} moved when the option order changed"
+        );
+    }
+    assert_eq!(
+        forward["answers"]["route"]["choice"],
+        reversed["answers"]["route"]["choice"]
+    );
+}
