@@ -42,6 +42,7 @@
 #![warn(missing_docs)]
 
 pub mod evaluate;
+pub mod perturb;
 pub mod prompt;
 pub mod readout;
 pub mod render;

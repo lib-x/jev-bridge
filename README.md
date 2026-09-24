@@ -541,6 +541,18 @@ so only the question tail is prefilled again.
 (`(K·max(p) - 1)/(K - 1)`, the shape the binary-candidate reference uses).
 Neither is TypeSafe's private formula; the response says which one it used.
 
+### Measuring option-order flips
+
+`--perturb --input rows.jsonl` scores every row, then scores it again with the
+options reversed, and reports how often the winning option moves. It needs no
+gold file: the baseline run is its own control, and the report carries the
+baseline winner's probability before and after the change.
+
+Measured on the reference endpoint with three rows, the letter contract flips
+one of them — the same question answered `frustrated` at 0.634, then `furious`
+with the baseline winner falling to 0.141 — while `--scoring binary` reports
+zero flips and identical probabilities in both orders.
+
 ## Startup contracts
 
 Two checks run before serving; failing either exits instead of scoring wrong

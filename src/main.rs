@@ -107,6 +107,11 @@ struct Args {
     #[arg(long)]
     input: Option<PathBuf>,
 
+    /// Score every --input row, then score it again with the options reversed,
+    /// and report how often the winning option changes; no gold file needed
+    #[arg(long)]
+    perturb: bool,
+
     /// Output JSONL for --score, created fresh
     #[arg(long)]
     output: Option<PathBuf>,
@@ -228,6 +233,37 @@ async fn run_score(bridge: &Bridge, input: &Path, output: &Path) -> Result<()> {
     }
     writer.flush()?;
     eprintln!("wrote {count} rows to {}", output.display());
+    Ok(())
+}
+
+/// The `--perturb` path: score every row, then score it again with the options
+/// reversed, and report how often the winning option moves.
+///
+/// Reversing the order is the sharpest perturbation for this bridge: the letter
+/// contract shows the model the options in order, and `--scoring binary` is the
+/// answer to the flips it causes.
+async fn run_perturb(bridge: &Bridge, input: &Path) -> Result<()> {
+    let reader = BufReader::new(
+        File::open(input).with_context(|| format!("opening {} failed", input.display()))?,
+    );
+    let mut rows = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(serde_json::from_str::<Row>(&line).with_context(|| {
+            format!("{}:{} is not a fastjev row", input.display(), index + 1)
+        })?);
+    }
+    let report = jev_bridge::perturb::run(bridge, &rows).await?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    eprintln!(
+        "{} flips of {} comparisons ({:.1}%)",
+        report.flips,
+        report.rows,
+        report.flip_rate * 100.0
+    );
     Ok(())
 }
 
@@ -426,6 +462,11 @@ async fn main() -> Result<()> {
             }))?
         );
         return Ok(());
+    }
+
+    if args.perturb {
+        let input = args.input.clone().context("--perturb requires --input")?;
+        return run_perturb(&bridge, &input).await;
     }
 
     if args.score {
